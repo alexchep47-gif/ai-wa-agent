@@ -1,50 +1,76 @@
 # AI WA Agent
 
-Agent IA WhatsApp **gratuit** — connexion simple, **sans préfixe**, prompt configurable avant la première utilisation.
+Agent IA WhatsApp **gratuit** — sans préfixe, prompt configurable, déploiement Render.
 
-## Comportement
+## Variables d'environnement (.env / Render)
 
-- Tu écris n'importe quel message → l'agent répond automatiquement
-- **Aucun préfixe** nécessaire (`.ai`, `.menu`, etc. ne sont plus obligatoires)
-- Le **prompt système** définit le rôle de l'agent **avant** qu'il reçoive le premier message
+| Variable | Obligatoire | Description |
+|----------|-------------|-------------|
+| `GEMINI_API_KEY` | Oui | Clé gratuite [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
+| `OWNER_NUMBER` | Oui | Ton numéro WhatsApp sans `+` (ex: `2376XXXXXXXX`) |
+| `SYSTEM_PROMPT` | Recommandé | Rôle de l'agent **avant** la première utilisation |
+| `BOT_NAME` | Non | Nom du bot (défaut: CMR AI Agent) |
+| `PORT` | Non | Laissé à Render |
 
-## Déploiement sur Render
+Sur **Render**, tu ne crées pas de fichier `.env` : tu ajoutes chaque variable dans **Environment**.
 
-### 1. Nouveau Web Service
-- [render.com](https://render.com) → **New +** → **Web Service**
-- Repo : `ai-wa-agent`
-- Runtime : **Docker**
-- Plan : **Free**
+---
 
-### 2. Variables d'environnement (très important)
+## Déploiement Render + connexion WhatsApp (iPhone)
 
-| Variable | Description | Exemple |
-|----------|-------------|--------|
-| `GEMINI_API_KEY` | Clé gratuite Gemini | `AIza...` |
-| `SYSTEM_PROMPT` | **Prompt de l'agent** (rôle + règles) | Voir exemple ci-dessous |
-| `OWNER_NUMBER` | Ton numéro (pour le pairing) | `2376XXXXXXXX` |
-| `BOT_NAME` | Nom affiché | `CMR AI Agent` |
+### Étape 1 — Créer le service
+1. Va sur [render.com](https://render.com) et connecte ton GitHub
+2. **New +** → **Web Service**
+3. Repo : `ai-wa-agent`
+4. Runtime : **Docker**
+5. Plan : **Free**
 
-#### Exemple de `SYSTEM_PROMPT`
+### Étape 2 — Variables d'environnement
+Dans **Environment**, ajoute :
 
 ```
-Tu es un professeur de Maths et Physique pour les classes de Seconde, Première et Terminale au Cameroun. Tu expliques clairement, tu donnes des exemples simples, et tu encourages l'élève. Réponds toujours en français, de façon courte et adaptée à WhatsApp.
+GEMINI_API_KEY = (ta clé Gemini)
+OWNER_NUMBER   = 2376XXXXXXXX
+SYSTEM_PROMPT  = Tu es un assistant éducatif camerounais...
+BOT_NAME       = CMR AI Agent
 ```
 
-Tu peux changer ce prompt à tout moment dans Render → Environment → puis redéployer.
+Puis **Create Web Service** / **Deploy**.
 
-### 3. Connexion WhatsApp
-1. Ouvre les **Logs** de Render
-2. Note le **code de pairing**
-3. WhatsApp → Appareils connectés → Lier avec un numéro → entre le code
+### Étape 3 — Récupérer le code de pairing
+1. Dans Render, ouvre ton service → onglet **Logs**
+2. Attends le démarrage (1–2 min)
+3. Cherche une ligne du type :
+   ```
+   🔑 CODE DE PAIRING : ABCD-EFGH
+   ```
+4. Note ce code (il expire assez vite)
 
-### 4. Utilisation
-Écris simplement un message (ex: *Explique la photosynthèse*) → l'agent répond.
+### Étape 4 — Lier WhatsApp sur ton iPhone
+1. Ouvre **WhatsApp**
+2. Va dans **Réglages** → **Appareils connectés**
+3. Appuie sur **Connecter un appareil**
+4. En bas, choisis **Lier avec un numéro de téléphone** (pas le QR)
+5. Entre le **code de pairing** affiché dans les Logs Render
+6. Valide
 
-## Clé Gemini gratuite
-[aistudio.google.com/apikey](https://aistudio.google.com/apikey)
+Tu dois voir dans les Logs :
+```
+✅ CMR AI Agent connecté à WhatsApp !
+```
 
-## Notes
-- Plan Free Render : le service s'endort après inactivité. Il se réveille au prochain message (parfois 30–60 s).
-- Les messages de **groupe** sont ignorés par défaut (pour éviter le spam).
+### Étape 5 — Tester
+Envoie un message **en privé** au numéro lié (ou depuis un autre téléphone vers le tien si le bot est sur ton compte) :
+
+> Explique la photosynthèse
+
+L'agent répond **sans préfixe**.
+
+---
+
+## Notes importantes
+
+- `OWNER_NUMBER` doit être le **même numéro** que le compte WhatsApp que tu veux lier.
+- Plan Free Render : le service s'endort après inactivité ; au réveil, la session peut se perdre et il faudra parfois **re-pairer**.
+- Les messages de **groupe** sont ignorés par défaut.
 - Ne partage jamais ta `GEMINI_API_KEY`.
