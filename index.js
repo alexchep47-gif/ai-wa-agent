@@ -6,6 +6,7 @@ const {
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   Browsers,
+  jidNormalizedUser,
 } = require('@whiskeysockets/baileys');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const pino = require('pino');
@@ -17,6 +18,8 @@ const PORT = process.env.PORT || 3000;
 const BOT_NAME = process.env.BOT_NAME || 'CMR AI Agent';
 const OWNER = (process.env.OWNER_NUMBER || process.env.PAIRING_NUMBER || '').replace(/\D/g, '');
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
+// true = répond aussi dans les groupes (pour test)
+const REPLY_IN_GROUPS = (process.env.REPLY_IN_GROUPS || 'false').toLowerCase() === 'true';
 
 const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
@@ -31,31 +34,68 @@ if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
 let model = null;
 if (GEMINI_KEY) {
-  const genAI = new GoogleGenerativeAI(GEMINI_KEY);
-  model = genAI.getGenerativeModel({
-    model: 'gemini-1.5-flash',
-    systemInstruction: SYSTEM_PROMPT,
-  });
-  console.log('Gemini: OK');
+  try {
+    const genAI = new GoogleGenerativeAI(GEMINI_KEY);
+    model = genAI.getGenerativeModel({
+      model: 'gemini-2.0-flash',
+      systemInstruction: SYSTEM_PROMPT,
+    });
+    console.log('[OK] Gemini initialisé (gemini-2.0-flash)');
+  } catch (e) {
+    console.error('[ERR] Gemini init:', e.message);
+  }
 } else {
-  console.log('ATTENTION: GEMINI_API_KEY manquante');
+  console.log('[WARN] GEMINI_API_KEY manquante — le bot ne pourra pas répondre en IA');
 }
 
 async function askAI(userMessage) {
-  if (!model) return '⚠️ Clé Gemini manquante. Ajoute GEMINI_API_KEY sur Render.';
+  if (!model) {
+    return '⚠️ Clé Gemini manquante ou invalide. Vérifie GEMINI_API_KEY sur Render.';
+  }
   try {
     const result = await model.generateContent(userMessage);
-    return result.response.text();
+    const text = result.response.text();
+    return text || '...';
   } catch (e) {
-    console.error('Gemini error:', e.message);
-    return '❌ Erreur IA. Vérifie ta clé Gemini.';
+    console.error('[ERR] Gemini:', e.message);
+    // Fallback ancien modèle
+    try {
+      const genAI = new GoogleGenerativeAI(GEMINI_KEY);
+      const fallback = genAI.getGenerativeModel({
+        model: 'gemini-1.5-flash',
+        systemInstruction: SYSTEM_PROMPT,
+      });
+      const result = await fallback.generateContent(userMessage);
+      return result.response.text() || '...';
+    } catch (e2) {
+      console.error('[ERR] Gemini fallback:', e2.message);
+      return '❌ Erreur IA: ' + (e.message || 'clé ou quota').slice(0, 120);
+    }
   }
+}
+
+function extractText(msg) {
+  const m = msg.message;
+  if (!m) return '';
+  return (
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.documentMessage?.caption ||
+    m.buttonsResponseMessage?.selectedDisplayText ||
+    m.listResponseMessage?.title ||
+    m.templateButtonReplyMessage?.selectedDisplayText ||
+    ''
+  );
 }
 
 const app = express();
 app.get('/', (req, res) => res.send(`${BOT_NAME} is running ✅`));
-app.get('/health', (req, res) => res.json({ status: 'ok', bot: BOT_NAME }));
-app.listen(PORT, () => console.log(`HTTP server on port ${PORT}`));
+app.get('/health', (req, res) =>
+  res.json({ status: 'ok', bot: BOT_NAME, gemini: !!model, owner: OWNER || null })
+);
+app.listen(PORT, () => console.log(`[OK] HTTP on port ${PORT}`));
 
 let pairingRequested = false;
 
@@ -63,8 +103,9 @@ async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
-  console.log('Baileys version:', version.join('.'));
-  console.log('OWNER_NUMBER (digits only):', OWNER || '(vide — pairing impossible)');
+  console.log('[OK] Baileys', version.join('.'));
+  console.log('[INFO] OWNER_NUMBER:', OWNER || '(vide)');
+  console.log('[INFO] REPLY_IN_GROUPS:', REPLY_IN_GROUPS);
 
   const sock = makeWASocket({
     version,
@@ -76,7 +117,8 @@ async function startBot() {
     },
     browser: Browsers.ubuntu('Chrome'),
     syncFullHistory: false,
-    markOnlineOnConnect: false,
+    markOnlineOnConnect: true,
+    getMessage: async () => undefined,
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -84,96 +126,107 @@ async function startBot() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // Afficher le QR en texte si présent (backup)
     if (qr) {
-      console.log('\n--- QR CODE (si pairing échoue, scanne avec un autre appareil) ---');
-      console.log(qr);
-      console.log('---------------------------------------------------------------\n');
+      console.log('[INFO] QR reçu (pairing préféré si possible)');
     }
 
-    // Demander le pairing code dès que possible
     if (!sock.authState.creds.registered && OWNER && !pairingRequested) {
       pairingRequested = true;
       setTimeout(async () => {
         try {
-          console.log(`Demande de pairing code pour le numéro: ${OWNER}`);
           const code = await sock.requestPairingCode(OWNER);
-          // Format lisible: ABCD-EFGH
           const pretty = code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
-          console.log('\n========================================');
-          console.log(`  CODE DE PAIRING : ${pretty}`);
-          console.log('========================================');
-          console.log('Sur iPhone: WhatsApp > Réglages > Appareils connectés');
-          console.log('> Connecter un appareil > Lier avec un numéro de téléphone');
-          console.log('Entre ce code (il expire en ~1 minute).\n');
+          console.log('\n======== CODE DE PAIRING ========');
+          console.log(`  ${pretty}`);
+          console.log('=================================\n');
         } catch (e) {
           pairingRequested = false;
-          console.error('Erreur pairing code:', e.message);
-          console.log('Vérifie OWNER_NUMBER (ex: 2376XXXXXXXX sans +).');
+          console.error('[ERR] Pairing:', e.message);
         }
       }, 4000);
     }
 
     if (connection === 'close') {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
-      console.log('Connexion fermée. Code:', code, '| Reconnexion:', shouldReconnect);
+      const status = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = status !== DisconnectReason.loggedOut;
+      console.log('[WARN] Connexion fermée. status=', status, 'reconnect=', shouldReconnect);
       pairingRequested = false;
       if (shouldReconnect) setTimeout(startBot, 4000);
-      else {
-        console.log('Déconnecté (logged out). Supprime auth_info et redéploie pour re-pairer.');
-      }
     } else if (connection === 'open') {
-      console.log(`\n✅ ${BOT_NAME} connecté à WhatsApp !\n`);
+      console.log(`\n[OK] ${BOT_NAME} CONNECTÉ À WHATSAPP`);
+      console.log('[OK] En attente de messages privés...\n');
     }
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-    const msg = messages[0];
-    if (!msg.message || msg.key.fromMe) return;
+    // Log TOUT pour debug
+    console.log('[MSG] upsert type=', type, 'count=', messages?.length);
 
-    const from = msg.key.remoteJid;
-    if (from.endsWith('@g.us')) return;
+    for (const msg of messages || []) {
+      try {
+        if (!msg.message) {
+          console.log('[MSG] skip: pas de message (proto vide)');
+          continue;
+        }
+        if (msg.key.fromMe) {
+          console.log('[MSG] skip: fromMe');
+          continue;
+        }
 
-    const text =
-      msg.message.conversation ||
-      msg.message.extendedTextMessage?.text ||
-      msg.message.imageMessage?.caption ||
-      '';
+        const from = msg.key.remoteJid;
+        const isGroup = from?.endsWith('@g.us');
+        const text = extractText(msg).trim();
 
-    if (!text || !text.trim()) return;
-    const body = text.trim();
-    const lower = body.toLowerCase();
+        console.log('[MSG] from=', from, 'group=', isGroup, 'text=', text.slice(0, 80));
 
-    try {
-      if (lower === 'menu' || lower === 'aide' || lower === 'help') {
-        await sock.sendMessage(from, {
-          text: `*${BOT_NAME}* 🤖\n\nÉcris-moi n'importe quoi, je te réponds.\n\nExemples :\n• Explique la photosynthèse\n• Résous 2x + 5 = 15`,
-        });
-        return;
+        if (!text) {
+          console.log('[MSG] skip: texte vide (média sans légende ?)');
+          continue;
+        }
+
+        if (isGroup && !REPLY_IN_GROUPS) {
+          console.log('[MSG] skip: groupe (mets REPLY_IN_GROUPS=true pour activer)');
+          continue;
+        }
+
+        // Ignore status / broadcast
+        if (from === 'status@broadcast') continue;
+
+        const lower = text.toLowerCase();
+
+        if (lower === 'menu' || lower === 'aide' || lower === 'help') {
+          await sock.sendMessage(from, {
+            text: `*${BOT_NAME}* 🤖\n\nÉcris-moi n'importe quoi, je te réponds.\n\nExemples :\n• Explique la photosynthèse\n• Résous 2x + 5 = 15`,
+          });
+          console.log('[MSG] répondu: menu');
+          continue;
+        }
+        if (lower === 'ping') {
+          await sock.sendMessage(from, { text: 'Pong ✅' });
+          console.log('[MSG] répondu: ping');
+          continue;
+        }
+        if (lower === 'info') {
+          await sock.sendMessage(from, {
+            text: `*${BOT_NAME}*\nGemini: ${model ? 'OK' : 'NON'}\nRender + Baileys`,
+          });
+          console.log('[MSG] répondu: info');
+          continue;
+        }
+
+        console.log('[MSG] appel Gemini...');
+        await sock.sendPresenceUpdate('composing', from).catch(() => {});
+        const reply = await askAI(text);
+        await sock.sendMessage(from, { text: reply });
+        console.log('[MSG] réponse envoyée (', reply.slice(0, 60), '...)');
+      } catch (err) {
+        console.error('[ERR] handler:', err.message || err);
       }
-      if (lower === 'ping') {
-        await sock.sendMessage(from, { text: 'Pong ✅' });
-        return;
-      }
-      if (lower === 'info') {
-        await sock.sendMessage(from, {
-          text: `*${BOT_NAME}*\nAgent IA éducatif\nGemini + Baileys\nRender`,
-        });
-        return;
-      }
-
-      await sock.sendPresenceUpdate('composing', from);
-      const reply = await askAI(body);
-      await sock.sendMessage(from, { text: reply });
-    } catch (err) {
-      console.error('Message error:', err.message);
     }
   });
 }
 
 startBot().catch((e) => {
-  console.error('Start error:', e);
+  console.error('[ERR] start:', e);
   setTimeout(startBot, 5000);
 });
