@@ -20,6 +20,15 @@ const OWNER = (process.env.OWNER_NUMBER || '').replace(/\D/g, '');
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const REPLY_IN_GROUPS = (process.env.REPLY_IN_GROUPS || 'false').toLowerCase() === 'true';
 
+// Modèles actuels (gemini-2.0-flash est shutdown depuis juin 2026)
+const GEMINI_MODELS = [
+  process.env.GEMINI_MODEL,
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  'gemini-3.8-flash',
+].filter(Boolean);
+
 const DEFAULT_SYSTEM_PROMPT = `Tu es un professeur de Maths et Physique pour les classes de Seconde, Première et Terminale au Cameroun.
 Tu expliques clairement, tu donnes des exemples simples, et tu encourages l'élève.
 Réponds toujours en français ou en anglais selon la langue du message reçu, de façon courte et adaptée à WhatsApp.
@@ -68,29 +77,47 @@ function detectLang(text) {
   return null;
 }
 
-let model = null;
-let visionModel = null;
+let genAI = null;
+let activeModelName = null;
+
 if (GEMINI_KEY) {
-  try {
-    const genAI = new GoogleGenerativeAI(GEMINI_KEY);
-    model = genAI.getGenerativeModel({
-      model: 'gemini-2.0-flash',
-      systemInstruction: SYSTEM_PROMPT,
-    });
-    visionModel = genAI.getGenerativeModel({
-      model: 'gemini-2.0-flash',
-      systemInstruction: SYSTEM_PROMPT,
-    });
-    console.log('[OK] Gemini prêt (texte + vision)');
-  } catch (e) {
-    console.error('[ERR] Gemini:', e.message);
-  }
+  genAI = new GoogleGenerativeAI(GEMINI_KEY);
+  activeModelName = GEMINI_MODELS[0];
+  console.log('[OK] Gemini configuré — modèles:', GEMINI_MODELS.join(' → '));
 } else {
   console.log('[WARN] GEMINI_API_KEY absente');
 }
 
+function getModel(name) {
+  return genAI.getGenerativeModel({
+    model: name,
+    systemInstruction: SYSTEM_PROMPT,
+  });
+}
+
+async function generateWithFallback(parts) {
+  if (!genAI) throw new Error('GEMINI_API_KEY manquante');
+  let lastErr;
+  for (const name of GEMINI_MODELS) {
+    try {
+      const m = getModel(name);
+      const result = await m.generateContent(parts);
+      const text = result.response.text();
+      if (activeModelName !== name) {
+        activeModelName = name;
+        console.log('[OK] Modèle actif:', name);
+      }
+      return text || '...';
+    } catch (e) {
+      lastErr = e;
+      console.error('[WARN] Échec modèle', name, ':', e.message?.slice(0, 100));
+    }
+  }
+  throw lastErr || new Error('Tous les modèles Gemini ont échoué');
+}
+
 async function askAI(userMessage, lang) {
-  if (!model) {
+  if (!genAI) {
     return lang === 'en'
       ? 'Gemini API key missing. Set GEMINI_API_KEY on Render.'
       : 'Clé Gemini manquante. Ajoute GEMINI_API_KEY sur Render.';
@@ -100,36 +127,28 @@ async function askAI(userMessage, lang) {
       ? 'Reply in English. Short WhatsApp style.\n\n'
       : 'Réponds en français. Style WhatsApp court.\n\n';
   try {
-    const result = await model.generateContent(prefix + userMessage);
-    return result.response.text() || '...';
+    return await generateWithFallback(prefix + userMessage);
   } catch (e) {
     console.error('[ERR] Gemini:', e.message);
-    try {
-      const genAI = new GoogleGenerativeAI(GEMINI_KEY);
-      const fb = genAI.getGenerativeModel({
-        model: 'gemini-1.5-flash',
-        systemInstruction: SYSTEM_PROMPT,
-      });
-      const r = await fb.generateContent(prefix + userMessage);
-      return r.response.text() || '...';
-    } catch (e2) {
-      return 'Erreur IA: ' + String(e.message).slice(0, 120);
-    }
+    return (
+      'Erreur IA: ' +
+      String(e.message || e).slice(0, 160) +
+      '\nVérifie GEMINI_API_KEY sur https://aistudio.google.com/apikey'
+    );
   }
 }
 
 async function askAIWithImage(caption, buffer, mimeType, lang) {
-  if (!visionModel) return askAI(caption || 'Analyse cette image', lang);
+  if (!genAI) return askAI(caption || 'Analyse cette image', lang);
   const prefix =
     lang === 'en'
       ? 'Analyze this image (exercise, diagram, text). Reply in English, short.\n'
       : 'Analyse cette image (exercice, schéma, texte). Réponds en français, court.\n';
   try {
-    const result = await visionModel.generateContent([
+    return await generateWithFallback([
       prefix + (caption || ''),
       { inlineData: { data: buffer.toString('base64'), mimeType: mimeType || 'image/jpeg' } },
     ]);
-    return result.response.text() || '...';
   } catch (e) {
     console.error('[ERR] vision:', e.message);
     return askAI(
@@ -201,12 +220,19 @@ app.get('/', (req, res) => {
   res.type('html').send(`
     <h2>${BOT_NAME}</h2>
     <p>WhatsApp: <b>${waReady ? 'CONNECTÉ' : 'hors ligne'}</b></p>
-    <p>Gemini: <b>${model ? 'OK' : 'NON'}</b></p>
+    <p>Gemini: <b>${genAI ? 'OK (' + (activeModelName || '?') + ')' : 'NON'}</b></p>
     <p><a href="/health">/health</a> · <a href="/test-send">/test-send</a></p>
   `);
 });
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', whatsapp: waReady, gemini: !!model, owner: OWNER || null, lastIncomingJid });
+  res.json({
+    status: 'ok',
+    whatsapp: waReady,
+    gemini: !!genAI,
+    model: activeModelName,
+    owner: OWNER || null,
+    lastIncomingJid,
+  });
 });
 app.get('/test-send', async (req, res) => {
   try {
@@ -266,7 +292,6 @@ async function startBot() {
     if (connection === 'close') {
       waReady = false;
       const status = lastDisconnect?.error?.output?.statusCode;
-      // 515 = restartRequired : normal juste après un pairing réussi
       if (status === 515) {
         console.log('[INFO] status 515 = restartRequired (normal après pairing). Relance...');
         pairingRequested = false;
