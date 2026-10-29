@@ -57,7 +57,6 @@ function storeMsg(msg) {
   }
 }
 
-// Langue par conversation (jid -> 'fr' | 'en')
 const langByJid = new Map();
 
 function detectLang(text) {
@@ -91,9 +90,11 @@ if (GEMINI_KEY) {
 }
 
 async function askAI(userMessage, lang) {
-  if (!model) return lang === 'en'
-    ? 'Gemini API key missing. Set GEMINI_API_KEY on Render.'
-    : 'Clé Gemini manquante. Ajoute GEMINI_API_KEY sur Render.';
+  if (!model) {
+    return lang === 'en'
+      ? 'Gemini API key missing. Set GEMINI_API_KEY on Render.'
+      : 'Clé Gemini manquante. Ajoute GEMINI_API_KEY sur Render.';
+  }
   const prefix =
     lang === 'en'
       ? 'Reply in English. Short WhatsApp style.\n\n'
@@ -132,10 +133,7 @@ async function askAIWithImage(caption, buffer, mimeType, lang) {
   } catch (e) {
     console.error('[ERR] vision:', e.message);
     return askAI(
-      (caption || '') +
-        '\n[Image reçue mais analyse vision échouée: ' +
-        e.message +
-        ']',
+      (caption || '') + '\n[Image reçue mais analyse vision échouée: ' + e.message + ']',
       lang
     );
   }
@@ -177,14 +175,26 @@ function isBroadcast(jid) {
 
 function wantsFile(text) {
   const t = (text || '').toLowerCase();
-  return /\b(fiche|fichier|file|génère|genere|generate|export|txt|pdf)\b/.test(t) &&
-    /\b(fiche|révision|revision|cours|summary|notes|fichier|file)\b/.test(t);
+  return (
+    /\b(fiche|fichier|file|génère|genere|generate|export|txt|pdf)\b/.test(t) &&
+    /\b(fiche|révision|revision|cours|summary|notes|fichier|file)\b/.test(t)
+  );
 }
 
 let sock = null;
 let waReady = false;
 let pairingRequested = false;
 let lastIncomingJid = null;
+let reconnectTimer = null;
+
+function scheduleReconnect(ms, reason) {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  console.log(`[INFO] Reconnexion dans ${ms / 1000}s (${reason})`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    startBot().catch((e) => console.error('[ERR] restart', e.message));
+  }, ms);
+}
 
 const app = express();
 app.get('/', (req, res) => {
@@ -218,7 +228,7 @@ app.listen(PORT, () => console.log('[OK] HTTP port', PORT));
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
-  console.log('[OK] Baileys', version.join('.'), '| OWNER=', OWNER || '(vide)');
+  console.log('[OK] Baileys', version.join('.'), '| OWNER=', OWNER || '(vide)', '| registered=', !!state.creds?.registered);
 
   sock = makeWASocket({
     version,
@@ -256,10 +266,21 @@ async function startBot() {
     if (connection === 'close') {
       waReady = false;
       const status = lastDisconnect?.error?.output?.statusCode;
-      const reconnect = status !== DisconnectReason.loggedOut;
-      console.log('[WARN] close status=', status, 'reconnect=', reconnect);
+      // 515 = restartRequired : normal juste après un pairing réussi
+      if (status === 515) {
+        console.log('[INFO] status 515 = restartRequired (normal après pairing). Relance...');
+        pairingRequested = false;
+        scheduleReconnect(2000, '515 restartRequired');
+        return;
+      }
+      if (status === DisconnectReason.loggedOut || status === 401) {
+        console.log('[ERR] Session déconnectée (loggedOut). Il faut re-pairer.');
+        pairingRequested = false;
+        return;
+      }
+      console.log('[WARN] close status=', status, '— reconnexion...');
       pairingRequested = false;
-      if (reconnect) setTimeout(startBot, 4000);
+      scheduleReconnect(4000, 'close ' + status);
     } else if (connection === 'open') {
       waReady = true;
       console.log(`[OK] ${BOT_NAME} CONNECTÉ — multimédia + CMR SCHOOL actifs`);
@@ -276,10 +297,7 @@ async function startBot() {
 
         const jid = msg.key.remoteJid;
         if (isBroadcast(jid)) continue;
-        if (isGroupJid(jid) && !REPLY_IN_GROUPS) {
-          console.log('[MSG] skip group');
-          continue;
-        }
+        if (isGroupJid(jid) && !REPLY_IN_GROUPS) continue;
 
         const text = extractText(msg).trim();
         const mediaType = getMediaType(msg);
@@ -289,7 +307,6 @@ async function startBot() {
 
         lastIncomingJid = jid;
 
-        // Langue
         let lang = langByJid.get(jid);
         const detected = detectLang(text);
         if (detected) {
@@ -307,35 +324,35 @@ async function startBot() {
         if (lower === 'menu' || lower === 'aide' || lower === 'help') {
           const menu =
             lang === 'en'
-              ? `*${BOT_NAME}*\nSend any question (Maths/Physics).\nSend a photo of an exercise.\nAsk about https://cmr-school.online\nSay "fiche revision ..." to get a text file.`
-              : `*${BOT_NAME}*\nEnvoie une question (Maths/Physique).\nEnvoie une photo d'exercice.\nPose des questions sur https://cmr-school.online\nDis "fiche révision ..." pour recevoir un fichier texte.`;
+              ? `*${BOT_NAME}*\nSend any Maths/Physics question.\nSend a photo of an exercise.\nAsk about https://cmr-school.online`
+              : `*${BOT_NAME}*\nEnvoie une question Maths/Physique.\nEnvoie une photo d'exercice.\nQuestions sur https://cmr-school.online`;
           await sock.sendMessage(jid, { text: menu });
           continue;
         }
 
         await sock.sendPresenceUpdate('composing', jid).catch(() => {});
 
-        // === Image ===
         if (mediaType === 'image') {
           try {
-            const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
-              logger,
-              reuploadRequest: sock.updateMediaMessage,
-            });
+            const buffer = await downloadMediaMessage(
+              msg,
+              'buffer',
+              {},
+              { logger, reuploadRequest: sock.updateMediaMessage }
+            );
             const mime = msg.message.imageMessage?.mimetype || 'image/jpeg';
             const reply = await askAIWithImage(text, buffer, mime, lang);
             await sock.sendMessage(jid, { text: reply });
-            console.log('[MSG] image analysée OK');
+            console.log('[MSG] image OK');
           } catch (e) {
             console.error('[ERR] image', e.message);
             await sock.sendMessage(jid, {
-              text: lang === 'en' ? 'Could not read the image.' : 'Impossible de lire l\'image.',
+              text: lang === 'en' ? 'Could not read the image.' : "Impossible de lire l'image.",
             });
           }
           continue;
         }
 
-        // === Document (PDF / texte) ===
         if (mediaType === 'document') {
           try {
             const doc =
@@ -343,10 +360,12 @@ async function startBot() {
               msg.message.documentWithCaptionMessage?.message?.documentMessage;
             const mime = doc?.mimetype || '';
             const fileName = doc?.fileName || 'fichier';
-            const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
-              logger,
-              reuploadRequest: sock.updateMediaMessage,
-            });
+            const buffer = await downloadMediaMessage(
+              msg,
+              'buffer',
+              {},
+              { logger, reuploadRequest: sock.updateMediaMessage }
+            );
 
             if (mime.startsWith('image/')) {
               const reply = await askAIWithImage(text || fileName, buffer, mime, lang);
@@ -354,18 +373,15 @@ async function startBot() {
             } else if (mime.includes('text') || fileName.endsWith('.txt') || fileName.endsWith('.md')) {
               const content = buffer.toString('utf8').slice(0, 12000);
               const reply = await askAI(
-                `Fichier reçu (${fileName}):\n${content}\n\n${text || 'Résume et aide l\'élève.'}`,
+                `Fichier reçu (${fileName}):\n${content}\n\n${text || "Résume et aide l'élève."}`,
                 lang
               );
               await sock.sendMessage(jid, { text: reply });
             } else if (mime.includes('pdf') || fileName.endsWith('.pdf')) {
-              // PDF binaire : on guide l'élève + répond au caption
               const reply = await askAI(
-                `L'élève a envoyé un PDF nommé "${fileName}". ` +
-                  (text
-                    ? `Légende / question: ${text}`
-                    : 'Explique que tu peux aider si on décrit l\'énoncé ou envoie une photo des pages importantes.') +
-                  ' Réponds utilement sans inventer le contenu du PDF.',
+                `L'élève a envoyé un PDF "${fileName}". ` +
+                  (text ? `Question: ${text}` : "Demande une photo des pages ou une description de l'énoncé.") +
+                  ' Ne invente pas le contenu du PDF.',
                 lang
               );
               await sock.sendMessage(jid, { text: reply });
@@ -373,26 +389,21 @@ async function startBot() {
               await sock.sendMessage(jid, {
                 text:
                   lang === 'en'
-                    ? `Received file (${fileName}). Send image/PDF text description or a photo of the exercise.`
-                    : `Fichier reçu (${fileName}). Envoie une photo de l'exercice ou décris l'énoncé.`,
+                    ? `File (${fileName}) received. Send a photo of the exercise.`
+                    : `Fichier (${fileName}) reçu. Envoie une photo de l'exercice.`,
               });
             }
-            console.log('[MSG] document traité', fileName);
+            console.log('[MSG] document OK', fileName);
           } catch (e) {
             console.error('[ERR] document', e.message);
-            await sock.sendMessage(jid, {
-              text: lang === 'en' ? 'Could not read the file.' : 'Impossible de lire le fichier.',
-            });
           }
           continue;
         }
 
-        // === Texte seul ===
         if (!text) continue;
 
         const reply = await askAI(text, lang);
 
-        // Générer un fichier .txt si demandé
         if (wantsFile(text) && reply.length > 80) {
           const fileBuf = Buffer.from(reply, 'utf8');
           const fname = `fiche-cmr-school-${Date.now()}.txt`;
@@ -402,7 +413,6 @@ async function startBot() {
             fileName: fname,
             caption: lang === 'en' ? 'Your revision sheet' : 'Ta fiche de révision',
           });
-          console.log('[MSG] fichier envoyé', fname);
         } else {
           await sock.sendMessage(jid, { text: reply });
         }
@@ -416,5 +426,5 @@ async function startBot() {
 
 startBot().catch((e) => {
   console.error('[ERR] start', e);
-  setTimeout(startBot, 5000);
+  scheduleReconnect(5000, 'start error');
 });
