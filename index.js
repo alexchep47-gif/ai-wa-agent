@@ -7,10 +7,16 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = process.env.PORT || 3000;
-const PREFIX = process.env.PREFIX || '.';
 const BOT_NAME = process.env.BOT_NAME || 'CMR AI Agent';
 const OWNER = process.env.OWNER_NUMBER || '';
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
+
+// Prompt système : défini AVANT la première utilisation (variable Render)
+const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT ||
+  `Tu es ${BOT_NAME}, un assistant éducatif camerounais amical, clair et concis.
+Tu aides les élèves (Seconde, Première, Terminale) en Maths, Physique, Chimie et culture générale.
+Réponds toujours en français, de façon utile et adaptée à WhatsApp (messages courts, paragraphes brefs).
+Si on te pose une question hors éducation, réponds quand même poliment et brièvement.`;
 
 const logger = pino({ level: 'silent' });
 const AUTH_DIR = path.join(__dirname, 'auth_info');
@@ -21,15 +27,18 @@ if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 let model = null;
 if (GEMINI_KEY) {
   const genAI = new GoogleGenerativeAI(GEMINI_KEY);
-  model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+  model = genAI.getGenerativeModel({
+    model: 'gemini-1.5-flash',
+    systemInstruction: SYSTEM_PROMPT,
+  });
 }
 
-async function askAI(prompt) {
-  if (!model) return '⚠️ Clé Gemini manquante. Ajoute GEMINI_API_KEY dans les variables Render.';
+async function askAI(userMessage) {
+  if (!model) {
+    return '⚠️ Clé Gemini manquante. Ajoute GEMINI_API_KEY dans les variables Render.';
+  }
   try {
-    const result = await model.generateContent(
-      `Tu es un assistant éducatif camerounais amical et concis. Réponds en français, de façon claire et utile (WhatsApp). Question: ${prompt}`
-    );
+    const result = await model.generateContent(userMessage);
     return result.response.text();
   } catch (e) {
     console.error('Gemini error:', e.message);
@@ -56,7 +65,7 @@ async function startBot() {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, logger),
     },
-    browser: ['CMR AI Agent', 'Chrome', '120.0.0'],
+    browser: [BOT_NAME, 'Chrome', '120.0.0'],
     generateHighQualityLinkPreview: true,
   });
 
@@ -70,11 +79,13 @@ async function startBot() {
     }
 
     if (connection === 'close') {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      const shouldReconnect =
+        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
       console.log('Connexion fermée. Reconnexion:', shouldReconnect);
       if (shouldReconnect) setTimeout(startBot, 3000);
     } else if (connection === 'open') {
-      console.log(`\n✅ ${BOT_NAME} connecté à WhatsApp !\n`);
+      console.log(`\n✅ ${BOT_NAME} connecté à WhatsApp !`);
+      console.log('Mode: réponse automatique sans préfixe (messages privés)\n');
     }
   });
 
@@ -85,7 +96,9 @@ async function startBot() {
       setTimeout(async () => {
         try {
           const code = await sock.requestPairingCode(phone.replace(/\D/g, ''));
-          console.log(`\n🔑 CODE DE PAIRING : ${code}\nEntre-le dans WhatsApp > Appareils connectés > Lier avec un numéro\n`);
+          console.log(
+            `\n🔑 CODE DE PAIRING : ${code}\nEntre-le dans WhatsApp > Appareils connectés > Lier avec un numéro\n`
+          );
         } catch (e) {
           console.log('Pairing code error:', e.message);
         }
@@ -100,57 +113,48 @@ async function startBot() {
 
     const from = msg.key.remoteJid;
     const isGroup = from.endsWith('@g.us');
+
+    // On ignore les groupes par défaut (pour éviter le spam)
+    // Tu pourras activer les groupes plus tard si besoin
+    if (isGroup) return;
+
     const text =
       msg.message.conversation ||
       msg.message.extendedTextMessage?.text ||
       msg.message.imageMessage?.caption ||
       '';
 
-    if (!text) return;
+    if (!text || !text.trim()) return;
 
     const body = text.trim();
-    const isCmd = body.startsWith(PREFIX);
-    const command = isCmd ? body.slice(PREFIX.length).split(' ')[0].toLowerCase() : '';
-    const args = isCmd ? body.slice(PREFIX.length + command.length).trim() : body;
+
+    // Commandes spéciales (optionnelles, sans préfixe obligatoire)
+    const lower = body.toLowerCase();
 
     try {
-      // Commandes
-      if (command === 'menu' || command === 'help') {
+      if (lower === 'menu' || lower === 'aide' || lower === 'help') {
         await sock.sendMessage(from, {
-          text: `*${BOT_NAME}* 🤖\n\nCommandes :\n• ${PREFIX}ai [question] — Pose une question à l'IA\n• ${PREFIX}menu — Ce menu\n• ${PREFIX}ping — Test\n• ${PREFIX}info — Infos\n\nTu peux aussi m'écrire directement sans commande.`,
+          text: `*${BOT_NAME}* 🤖\n\nÉcris-moi n'importe quoi, je te réponds directement.\n\nExemples :\n• Explique la photosynthèse\n• Résous 2x + 5 = 15\n• Donne-moi un quiz de chimie\n\nPas besoin de préfixe.`,
         });
         return;
       }
 
-      if (command === 'ping') {
+      if (lower === 'ping') {
         await sock.sendMessage(from, { text: 'Pong ✅' });
         return;
       }
 
-      if (command === 'info') {
+      if (lower === 'info') {
         await sock.sendMessage(from, {
-          text: `*${BOT_NAME}*\nAgent IA éducatif\nPowered by Gemini + Baileys\nDéployé sur Render`,
+          text: `*${BOT_NAME}*\nAgent IA éducatif\nPowered by Gemini + Baileys\nDéployé sur Render\n\nPrompt système configuré ✅`,
         });
         return;
       }
 
-      if (command === 'ai' || command === 'bot' || command === 'ask') {
-        if (!args) {
-          await sock.sendMessage(from, { text: `Exemple : ${PREFIX}ai Explique la photosynthèse` });
-          return;
-        }
-        await sock.sendPresenceUpdate('composing', from);
-        const reply = await askAI(args);
-        await sock.sendMessage(from, { text: reply });
-        return;
-      }
-
-      // Message normal (sans commande) → réponse IA (uniquement en privé pour éviter le spam de groupe)
-      if (!isCmd && !isGroup && model) {
-        await sock.sendPresenceUpdate('composing', from);
-        const reply = await askAI(body);
-        await sock.sendMessage(from, { text: reply });
-      }
+      // === Réponse IA automatique (sans préfixe) ===
+      await sock.sendPresenceUpdate('composing', from);
+      const reply = await askAI(body);
+      await sock.sendMessage(from, { text: reply });
     } catch (err) {
       console.error('Message error:', err);
     }
