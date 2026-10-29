@@ -6,7 +6,6 @@ const {
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   Browsers,
-  jidNormalizedUser,
 } = require('@whiskeysockets/baileys');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const pino = require('pino');
@@ -16,21 +15,30 @@ const path = require('path');
 
 const PORT = process.env.PORT || 3000;
 const BOT_NAME = process.env.BOT_NAME || 'CMR AI Agent';
-const OWNER = (process.env.OWNER_NUMBER || process.env.PAIRING_NUMBER || '').replace(/\D/g, '');
+const OWNER = (process.env.OWNER_NUMBER || '').replace(/\D/g, '');
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
-// true = répond aussi dans les groupes (pour test)
 const REPLY_IN_GROUPS = (process.env.REPLY_IN_GROUPS || 'false').toLowerCase() === 'true';
 
 const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
-  `Tu es ${BOT_NAME}, un assistant éducatif camerounais amical, clair et concis.
-Tu aides les élèves (Seconde, Première, Terminale) en Maths, Physique, Chimie et culture générale.
-Réponds toujours en français, de façon utile et adaptée à WhatsApp (messages courts).`;
+  `Tu es ${BOT_NAME}, un assistant éducatif camerounais amical et concis.
+Réponds en français, messages courts, adaptés à WhatsApp.`;
 
 const logger = pino({ level: 'silent' });
 const AUTH_DIR = path.join(__dirname, 'auth_info');
-
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+
+// Store minimal pour getMessage (nécessaire pour l'envoi fiable)
+const msgStore = new Map();
+function storeMsg(msg) {
+  if (msg?.key?.id) {
+    msgStore.set(msg.key.id, msg);
+    if (msgStore.size > 200) {
+      const first = msgStore.keys().next().value;
+      msgStore.delete(first);
+    }
+  }
+}
 
 let model = null;
 if (GEMINI_KEY) {
@@ -40,36 +48,31 @@ if (GEMINI_KEY) {
       model: 'gemini-2.0-flash',
       systemInstruction: SYSTEM_PROMPT,
     });
-    console.log('[OK] Gemini initialisé (gemini-2.0-flash)');
+    console.log('[OK] Gemini prêt');
   } catch (e) {
-    console.error('[ERR] Gemini init:', e.message);
+    console.error('[ERR] Gemini:', e.message);
   }
 } else {
-  console.log('[WARN] GEMINI_API_KEY manquante — le bot ne pourra pas répondre en IA');
+  console.log('[WARN] GEMINI_API_KEY absente');
 }
 
 async function askAI(userMessage) {
-  if (!model) {
-    return '⚠️ Clé Gemini manquante ou invalide. Vérifie GEMINI_API_KEY sur Render.';
-  }
+  if (!model) return '⚠️ GEMINI_API_KEY manquante ou invalide sur Render.';
   try {
     const result = await model.generateContent(userMessage);
-    const text = result.response.text();
-    return text || '...';
+    return result.response.text() || 'OK';
   } catch (e) {
-    console.error('[ERR] Gemini:', e.message);
-    // Fallback ancien modèle
+    console.error('[ERR] Gemini call:', e.message);
     try {
       const genAI = new GoogleGenerativeAI(GEMINI_KEY);
-      const fallback = genAI.getGenerativeModel({
+      const fb = genAI.getGenerativeModel({
         model: 'gemini-1.5-flash',
         systemInstruction: SYSTEM_PROMPT,
       });
-      const result = await fallback.generateContent(userMessage);
-      return result.response.text() || '...';
+      const r = await fb.generateContent(userMessage);
+      return r.response.text() || 'OK';
     } catch (e2) {
-      console.error('[ERR] Gemini fallback:', e2.message);
-      return '❌ Erreur IA: ' + (e.message || 'clé ou quota').slice(0, 120);
+      return '❌ Erreur IA: ' + String(e.message || e2.message).slice(0, 150);
     }
   }
 }
@@ -77,6 +80,9 @@ async function askAI(userMessage) {
 function extractText(msg) {
   const m = msg.message;
   if (!m) return '';
+  if (m.ephemeralMessage) return extractText({ message: m.ephemeralMessage.message });
+  if (m.viewOnceMessage) return extractText({ message: m.viewOnceMessage.message });
+  if (m.viewOnceMessageV2) return extractText({ message: m.viewOnceMessageV2.message });
   return (
     m.conversation ||
     m.extendedTextMessage?.text ||
@@ -85,29 +91,84 @@ function extractText(msg) {
     m.documentMessage?.caption ||
     m.buttonsResponseMessage?.selectedDisplayText ||
     m.listResponseMessage?.title ||
-    m.templateButtonReplyMessage?.selectedDisplayText ||
     ''
   );
 }
 
-const app = express();
-app.get('/', (req, res) => res.send(`${BOT_NAME} is running ✅`));
-app.get('/health', (req, res) =>
-  res.json({ status: 'ok', bot: BOT_NAME, gemini: !!model, owner: OWNER || null })
-);
-app.listen(PORT, () => console.log(`[OK] HTTP on port ${PORT}`));
+function isGroupJid(jid) {
+  return typeof jid === 'string' && jid.endsWith('@g.us');
+}
 
+function isBroadcast(jid) {
+  return (
+    !jid ||
+    jid === 'status@broadcast' ||
+    jid.endsWith('@broadcast') ||
+    jid.endsWith('@newsletter')
+  );
+}
+
+// Socket global pour /test-send
+let sock = null;
+let waReady = false;
 let pairingRequested = false;
+let lastIncomingJid = null;
+
+const app = express();
+app.get('/', (req, res) => {
+  res.type('html').send(`
+    <h2>${BOT_NAME}</h2>
+    <p>WhatsApp: <b>${waReady ? 'CONNECTÉ' : 'hors ligne'}</b></p>
+    <p>Gemini: <b>${model ? 'OK' : 'NON'}</b></p>
+    <p><a href="/health">/health</a> · <a href="/test-send">/test-send</a></p>
+  `);
+});
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    whatsapp: waReady,
+    gemini: !!model,
+    owner: OWNER || null,
+    lastIncomingJid,
+  });
+});
+
+// Force l'envoi d'un message (pour tester)
+// Exemple: /test-send?text=Bonjour
+// Ou: /test-send?to=2376XXXXXXXX&text=Bonjour
+app.get('/test-send', async (req, res) => {
+  try {
+    if (!sock || !waReady) {
+      return res.status(503).json({ ok: false, error: 'WhatsApp pas encore connecté' });
+    }
+    const text = (req.query.text || `Test ${BOT_NAME} ✅`).toString();
+    let jid = (req.query.to || '').toString().replace(/\D/g, '');
+    if (jid) jid = jid + '@s.whatsapp.net';
+    else if (lastIncomingJid) jid = lastIncomingJid;
+    else if (OWNER) jid = OWNER + '@s.whatsapp.net';
+    else {
+      return res.status(400).json({
+        ok: false,
+        error: 'Indique ?to=2376XXXXXXXX ou attends un message entrant',
+      });
+    }
+    console.log('[TEST] Envoi vers', jid, ':', text);
+    await sock.sendMessage(jid, { text });
+    res.json({ ok: true, to: jid, text });
+  } catch (e) {
+    console.error('[TEST] ERR', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.listen(PORT, () => console.log('[OK] HTTP port', PORT));
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
+  console.log('[OK] Baileys', version.join('.'), '| OWNER=', OWNER || '(vide)');
 
-  console.log('[OK] Baileys', version.join('.'));
-  console.log('[INFO] OWNER_NUMBER:', OWNER || '(vide)');
-  console.log('[INFO] REPLY_IN_GROUPS:', REPLY_IN_GROUPS);
-
-  const sock = makeWASocket({
+  sock = makeWASocket({
     version,
     logger,
     printQRInTerminal: false,
@@ -118,17 +179,13 @@ async function startBot() {
     browser: Browsers.ubuntu('Chrome'),
     syncFullHistory: false,
     markOnlineOnConnect: true,
-    getMessage: async () => undefined,
+    getMessage: async (key) => msgStore.get(key.id) || undefined,
   });
 
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      console.log('[INFO] QR reçu (pairing préféré si possible)');
-    }
+    const { connection, lastDisconnect } = update;
 
     if (!sock.authState.creds.registered && OWNER && !pairingRequested) {
       pairingRequested = true;
@@ -136,97 +193,83 @@ async function startBot() {
         try {
           const code = await sock.requestPairingCode(OWNER);
           const pretty = code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
-          console.log('\n======== CODE DE PAIRING ========');
-          console.log(`  ${pretty}`);
-          console.log('=================================\n');
+          console.log('\n*** CODE DE PAIRING:', pretty, '***\n');
         } catch (e) {
           pairingRequested = false;
-          console.error('[ERR] Pairing:', e.message);
+          console.error('[ERR] pairing', e.message);
         }
       }, 4000);
     }
 
     if (connection === 'close') {
+      waReady = false;
       const status = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = status !== DisconnectReason.loggedOut;
-      console.log('[WARN] Connexion fermée. status=', status, 'reconnect=', shouldReconnect);
+      const reconnect = status !== DisconnectReason.loggedOut;
+      console.log('[WARN] close status=', status, 'reconnect=', reconnect);
       pairingRequested = false;
-      if (shouldReconnect) setTimeout(startBot, 4000);
+      if (reconnect) setTimeout(startBot, 4000);
     } else if (connection === 'open') {
-      console.log(`\n[OK] ${BOT_NAME} CONNECTÉ À WHATSAPP`);
-      console.log('[OK] En attente de messages privés...\n');
+      waReady = true;
+      console.log(`[OK] ${BOT_NAME} CONNECTÉ — en attente de messages`);
+      console.log('[TIP] Test envoi: ouvre https://TON-SERVICE.onrender.com/test-send?text=hello');
     }
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    // Log TOUT pour debug
-    console.log('[MSG] upsert type=', type, 'count=', messages?.length);
+    console.log('[MSG] event type=', type, 'n=', messages?.length || 0);
 
     for (const msg of messages || []) {
       try {
+        storeMsg(msg);
+
         if (!msg.message) {
-          console.log('[MSG] skip: pas de message (proto vide)');
+          console.log('[MSG] skip no content', msg.key?.remoteJid);
           continue;
         }
         if (msg.key.fromMe) {
-          console.log('[MSG] skip: fromMe');
+          console.log('[MSG] skip fromMe');
           continue;
         }
 
-        const from = msg.key.remoteJid;
-        const isGroup = from?.endsWith('@g.us');
+        // JID d'envoi: garder le remoteJid tel quel (@lid ou @s.whatsapp.net)
+        const jid = msg.key.remoteJid;
+        if (isBroadcast(jid)) continue;
+
+        if (isGroupJid(jid) && !REPLY_IN_GROUPS) {
+          console.log('[MSG] skip group', jid);
+          continue;
+        }
+
         const text = extractText(msg).trim();
+        console.log('[MSG] jid=', jid, '| text=', JSON.stringify(text.slice(0, 100)));
 
-        console.log('[MSG] from=', from, 'group=', isGroup, 'text=', text.slice(0, 80));
+        if (!text) continue;
 
-        if (!text) {
-          console.log('[MSG] skip: texte vide (média sans légende ?)');
-          continue;
-        }
-
-        if (isGroup && !REPLY_IN_GROUPS) {
-          console.log('[MSG] skip: groupe (mets REPLY_IN_GROUPS=true pour activer)');
-          continue;
-        }
-
-        // Ignore status / broadcast
-        if (from === 'status@broadcast') continue;
-
+        lastIncomingJid = jid;
         const lower = text.toLowerCase();
 
-        if (lower === 'menu' || lower === 'aide' || lower === 'help') {
-          await sock.sendMessage(from, {
-            text: `*${BOT_NAME}* 🤖\n\nÉcris-moi n'importe quoi, je te réponds.\n\nExemples :\n• Explique la photosynthèse\n• Résous 2x + 5 = 15`,
-          });
-          console.log('[MSG] répondu: menu');
-          continue;
-        }
-        if (lower === 'ping') {
-          await sock.sendMessage(from, { text: 'Pong ✅' });
-          console.log('[MSG] répondu: ping');
-          continue;
-        }
-        if (lower === 'info') {
-          await sock.sendMessage(from, {
-            text: `*${BOT_NAME}*\nGemini: ${model ? 'OK' : 'NON'}\nRender + Baileys`,
-          });
-          console.log('[MSG] répondu: info');
-          continue;
+        let reply;
+        if (lower === 'ping') reply = 'Pong ✅';
+        else if (lower === 'menu' || lower === 'aide' || lower === 'help') {
+          reply = `*${BOT_NAME}*\nÉcris n'importe quoi, je réponds sans préfixe.`;
+        } else if (lower === 'info') {
+          reply = `*${BOT_NAME}*\nGemini: ${model ? 'OK' : 'NON'}\nWhatsApp: connecté`;
+        } else {
+          console.log('[MSG] Gemini...');
+          await sock.sendPresenceUpdate('composing', jid).catch(() => {});
+          reply = await askAI(text);
         }
 
-        console.log('[MSG] appel Gemini...');
-        await sock.sendPresenceUpdate('composing', from).catch(() => {});
-        const reply = await askAI(text);
-        await sock.sendMessage(from, { text: reply });
-        console.log('[MSG] réponse envoyée (', reply.slice(0, 60), '...)');
+        await sock.sendMessage(jid, { text: reply });
+        console.log('[MSG] ENVOYÉ OK ->', jid);
       } catch (err) {
-        console.error('[ERR] handler:', err.message || err);
+        console.error('[ERR] handler', err?.message || err);
       }
     }
   });
 }
 
 startBot().catch((e) => {
-  console.error('[ERR] start:', e);
+  console.error('[ERR] start', e);
   setTimeout(startBot, 5000);
 });
