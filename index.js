@@ -1,5 +1,12 @@
 require('dotenv').config();
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
+  Browsers,
+} = require('@whiskeysockets/baileys');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const pino = require('pino');
 const express = require('express');
@@ -8,22 +15,20 @@ const path = require('path');
 
 const PORT = process.env.PORT || 3000;
 const BOT_NAME = process.env.BOT_NAME || 'CMR AI Agent';
-const OWNER = process.env.OWNER_NUMBER || '';
+const OWNER = (process.env.OWNER_NUMBER || process.env.PAIRING_NUMBER || '').replace(/\D/g, '');
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 
-// Prompt système : défini AVANT la première utilisation (variable Render)
-const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT ||
+const SYSTEM_PROMPT =
+  process.env.SYSTEM_PROMPT ||
   `Tu es ${BOT_NAME}, un assistant éducatif camerounais amical, clair et concis.
 Tu aides les élèves (Seconde, Première, Terminale) en Maths, Physique, Chimie et culture générale.
-Réponds toujours en français, de façon utile et adaptée à WhatsApp (messages courts, paragraphes brefs).
-Si on te pose une question hors éducation, réponds quand même poliment et brièvement.`;
+Réponds toujours en français, de façon utile et adaptée à WhatsApp (messages courts).`;
 
 const logger = pino({ level: 'silent' });
 const AUTH_DIR = path.join(__dirname, 'auth_info');
 
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
-// === Gemini ===
 let model = null;
 if (GEMINI_KEY) {
   const genAI = new GoogleGenerativeAI(GEMINI_KEY);
@@ -31,42 +36,47 @@ if (GEMINI_KEY) {
     model: 'gemini-1.5-flash',
     systemInstruction: SYSTEM_PROMPT,
   });
+  console.log('Gemini: OK');
+} else {
+  console.log('ATTENTION: GEMINI_API_KEY manquante');
 }
 
 async function askAI(userMessage) {
-  if (!model) {
-    return '⚠️ Clé Gemini manquante. Ajoute GEMINI_API_KEY dans les variables Render.';
-  }
+  if (!model) return '⚠️ Clé Gemini manquante. Ajoute GEMINI_API_KEY sur Render.';
   try {
     const result = await model.generateContent(userMessage);
     return result.response.text();
   } catch (e) {
     console.error('Gemini error:', e.message);
-    return '❌ Erreur IA. Vérifie ta clé Gemini ou réessaie plus tard.';
+    return '❌ Erreur IA. Vérifie ta clé Gemini.';
   }
 }
 
-// === Express keep-alive (important pour Render) ===
 const app = express();
 app.get('/', (req, res) => res.send(`${BOT_NAME} is running ✅`));
 app.get('/health', (req, res) => res.json({ status: 'ok', bot: BOT_NAME }));
-app.listen(PORT, () => console.log(`Server on port ${PORT}`));
+app.listen(PORT, () => console.log(`HTTP server on port ${PORT}`));
 
-// === WhatsApp ===
+let pairingRequested = false;
+
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
+  console.log('Baileys version:', version.join('.'));
+  console.log('OWNER_NUMBER (digits only):', OWNER || '(vide — pairing impossible)');
+
   const sock = makeWASocket({
     version,
     logger,
-    printQRInTerminal: true,
+    printQRInTerminal: false,
     auth: {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, logger),
     },
-    browser: [BOT_NAME, 'Chrome', '120.0.0'],
-    generateHighQualityLinkPreview: true,
+    browser: Browsers.ubuntu('Chrome'),
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -74,37 +84,49 @@ async function startBot() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
+    // Afficher le QR en texte si présent (backup)
     if (qr) {
-      console.log('\n📱 Scanne le QR ou utilise le pairing code ci-dessous.\n');
+      console.log('\n--- QR CODE (si pairing échoue, scanne avec un autre appareil) ---');
+      console.log(qr);
+      console.log('---------------------------------------------------------------\n');
+    }
+
+    // Demander le pairing code dès que possible
+    if (!sock.authState.creds.registered && OWNER && !pairingRequested) {
+      pairingRequested = true;
+      setTimeout(async () => {
+        try {
+          console.log(`Demande de pairing code pour le numéro: ${OWNER}`);
+          const code = await sock.requestPairingCode(OWNER);
+          // Format lisible: ABCD-EFGH
+          const pretty = code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
+          console.log('\n========================================');
+          console.log(`  CODE DE PAIRING : ${pretty}`);
+          console.log('========================================');
+          console.log('Sur iPhone: WhatsApp > Réglages > Appareils connectés');
+          console.log('> Connecter un appareil > Lier avec un numéro de téléphone');
+          console.log('Entre ce code (il expire en ~1 minute).\n');
+        } catch (e) {
+          pairingRequested = false;
+          console.error('Erreur pairing code:', e.message);
+          console.log('Vérifie OWNER_NUMBER (ex: 2376XXXXXXXX sans +).');
+        }
+      }, 4000);
     }
 
     if (connection === 'close') {
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log('Connexion fermée. Reconnexion:', shouldReconnect);
-      if (shouldReconnect) setTimeout(startBot, 3000);
+      const code = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = code !== DisconnectReason.loggedOut;
+      console.log('Connexion fermée. Code:', code, '| Reconnexion:', shouldReconnect);
+      pairingRequested = false;
+      if (shouldReconnect) setTimeout(startBot, 4000);
+      else {
+        console.log('Déconnecté (logged out). Supprime auth_info et redéploie pour re-pairer.');
+      }
     } else if (connection === 'open') {
-      console.log(`\n✅ ${BOT_NAME} connecté à WhatsApp !`);
-      console.log('Mode: réponse automatique sans préfixe (messages privés)\n');
+      console.log(`\n✅ ${BOT_NAME} connecté à WhatsApp !\n`);
     }
   });
-
-  // Pairing code (plus simple sur téléphone)
-  if (!sock.authState.creds.registered) {
-    const phone = OWNER || process.env.PAIRING_NUMBER;
-    if (phone) {
-      setTimeout(async () => {
-        try {
-          const code = await sock.requestPairingCode(phone.replace(/\D/g, ''));
-          console.log(
-            `\n🔑 CODE DE PAIRING : ${code}\nEntre-le dans WhatsApp > Appareils connectés > Lier avec un numéro\n`
-          );
-        } catch (e) {
-          console.log('Pairing code error:', e.message);
-        }
-      }, 3000);
-    }
-  }
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
@@ -112,11 +134,7 @@ async function startBot() {
     if (!msg.message || msg.key.fromMe) return;
 
     const from = msg.key.remoteJid;
-    const isGroup = from.endsWith('@g.us');
-
-    // On ignore les groupes par défaut (pour éviter le spam)
-    // Tu pourras activer les groupes plus tard si besoin
-    if (isGroup) return;
+    if (from.endsWith('@g.us')) return;
 
     const text =
       msg.message.conversation ||
@@ -125,38 +143,32 @@ async function startBot() {
       '';
 
     if (!text || !text.trim()) return;
-
     const body = text.trim();
-
-    // Commandes spéciales (optionnelles, sans préfixe obligatoire)
     const lower = body.toLowerCase();
 
     try {
       if (lower === 'menu' || lower === 'aide' || lower === 'help') {
         await sock.sendMessage(from, {
-          text: `*${BOT_NAME}* 🤖\n\nÉcris-moi n'importe quoi, je te réponds directement.\n\nExemples :\n• Explique la photosynthèse\n• Résous 2x + 5 = 15\n• Donne-moi un quiz de chimie\n\nPas besoin de préfixe.`,
+          text: `*${BOT_NAME}* 🤖\n\nÉcris-moi n'importe quoi, je te réponds.\n\nExemples :\n• Explique la photosynthèse\n• Résous 2x + 5 = 15`,
         });
         return;
       }
-
       if (lower === 'ping') {
         await sock.sendMessage(from, { text: 'Pong ✅' });
         return;
       }
-
       if (lower === 'info') {
         await sock.sendMessage(from, {
-          text: `*${BOT_NAME}*\nAgent IA éducatif\nPowered by Gemini + Baileys\nDéployé sur Render\n\nPrompt système configuré ✅`,
+          text: `*${BOT_NAME}*\nAgent IA éducatif\nGemini + Baileys\nRender`,
         });
         return;
       }
 
-      // === Réponse IA automatique (sans préfixe) ===
       await sock.sendPresenceUpdate('composing', from);
       const reply = await askAI(body);
       await sock.sendMessage(from, { text: reply });
     } catch (err) {
-      console.error('Message error:', err);
+      console.error('Message error:', err.message);
     }
   });
 }
