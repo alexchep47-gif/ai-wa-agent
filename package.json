@@ -1,7 +1,7 @@
 {
   "name": "ai-wa-agent",
-  "version": "1.0.0",
-  "description": "Agent IA WhatsApp gratuit et simple - multi-tâches, déploiement Render",
+  "version": "1.1.0",
+  "description": "Agent IA WhatsApp CMR SCHOOL - Maths/Physique, multimédia, site cmr-school.online",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
