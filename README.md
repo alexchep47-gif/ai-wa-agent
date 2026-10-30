@@ -71,6 +71,6 @@ L'agent répond **sans préfixe**.
 ## Notes importantes
 
 - `OWNER_NUMBER` doit être le **même numéro** que le compte WhatsApp que tu veux lier.
-- Plan Free Render : le service s'endort après inactivité ; au réveil, la session peut se perdre et il faudra parfois **re-pairer**.
+- La session WhatsApp est stockée dans les fichiers locaux `auth_info` (aucune base de données externe). Sur Render Free, le système de fichiers peut être éphémère : après un redémarrage ou un redéploiement, il faudra parfois **re-pairer**.
 - Les messages de **groupe** sont ignorés par défaut.
 - Ne partage jamais ta `GEMINI_API_KEY`.

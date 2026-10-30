@@ -14,7 +14,6 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const { textToPdf } = require('./lib/pdf');
-const { useMongoAuthState } = require('./lib/mongoAuth');
 
 const PORT = process.env.PORT || 3000;
 const BOT_NAME = process.env.BOT_NAME || 'CMR SCHOOL';
@@ -23,7 +22,6 @@ const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const REPLY_IN_GROUPS = (process.env.REPLY_IN_GROUPS || 'false').toLowerCase() === 'true';
 const ADMIN_NUMBER = (process.env.ADMIN_NUMBER || '237698877771').replace(/\D/g, '');
 const ADMIN_JID = ADMIN_NUMBER + '@s.whatsapp.net';
-const MONGODB_URI = process.env.MONGODB_URI || '';
 
 const GEMINI_MODELS = [
   process.env.GEMINI_MODEL,
@@ -111,8 +109,6 @@ if (GEMINI_KEY) {
   console.log('[OK] Gemini —', GEMINI_MODELS.join(' → '));
 } else console.log('[WARN] GEMINI_API_KEY absente');
 console.log('[OK] ADMIN dépôts:', ADMIN_NUMBER);
-if (MONGODB_URI) console.log('[OK] MONGODB_URI défini → session persistante');
-else console.log('[WARN] Pas de MONGODB_URI → session perdue à chaque deploy Render');
 
 function getModel(name) {
   return genAI.getGenerativeModel({ model: name, systemInstruction: SYSTEM_PROMPT });
@@ -218,15 +214,7 @@ async function notifyAdminDeposit(clientPhone, clientJid) {
 }
 
 async function loadAuthState() {
-  if (MONGODB_URI) {
-    try {
-      return await useMongoAuthState(MONGODB_URI);
-    } catch (e) {
-      console.error('[AUTH] Mongo échoué:', e.message, '— fallback fichiers locaux');
-    }
-  }
-  const local = await useMultiFileAuthState(AUTH_DIR);
-  return { state: local.state, saveCreds: local.saveCreds };
+  return useMultiFileAuthState(AUTH_DIR);
 }
 
 const app = express();
@@ -236,16 +224,14 @@ app.get('/', (req, res) => {
       BOT_NAME +
       '</h2><p>WhatsApp: <b>' +
       (waReady ? 'CONNECTÉ' : 'hors ligne') +
-      '</b></p><p>Session: <b>' +
-      (MONGODB_URI ? 'MongoDB (persistante)' : 'locale (volatile)') +
-      '</b></p>'
+      '</b></p><p>Session: <b>locale (fichiers)</b></p>'
   );
 });
 app.get('/health', (req, res) =>
   res.json({
     status: 'ok',
     whatsapp: waReady,
-    session: MONGODB_URI ? 'mongodb' : 'local',
+    session: 'local',
     admin: ADMIN_NUMBER,
   })
 );
@@ -261,7 +247,7 @@ async function startBot() {
   console.log('[BOOT]', myBoot, '| Baileys', version.join('.'));
   console.log('[BOOT] OWNER_NUMBER =', OWNER || '(VIDE)');
   console.log('[BOOT] registered =', registered);
-  console.log('[BOOT] session store =', MONGODB_URI ? 'MongoDB' : 'fichiers locaux');
+  console.log('[BOOT] session store = fichiers locaux');
   console.log('----------------------------------------');
 
   sock = makeWASocket({
@@ -320,7 +306,7 @@ async function startBot() {
       scheduleReconnect(5000, 'close');
     } else if (connection === 'open') {
       waReady = true;
-      console.log('\n[OK] CONNECTÉ À WHATSAPP | store=', MONGODB_URI ? 'MongoDB' : 'local', '\n');
+      console.log('\n[OK] CONNECTÉ À WHATSAPP | store= local\n');
     }
   });
 
