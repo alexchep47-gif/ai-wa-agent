@@ -7,6 +7,7 @@ const {
   makeCacheableSignalKeyStore,
   Browsers,
   downloadMediaMessage,
+  generateMessageIDV2,
 } = require('@whiskeysockets/baileys');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const pino = require('pino');
@@ -26,6 +27,7 @@ const {
   parsePollTimes,
 } = require('./lib/channel-polls');
 const { canPublishToChannel, isAdminSender, parseAdminNumbers } = require('./lib/admin-numbers');
+const { DAILY_INTERACTION_FORMATS, createNativeQuestionMessage, createNativeQuizMessage } = require('./lib/channel-native');
 
 const PORT = process.env.PORT || 3000;
 const BOT_NAME = process.env.BOT_NAME || 'CMR SCHOOL';
@@ -489,12 +491,24 @@ async function dispatchChannelPollJob(job) {
     if (job.kind === 'poll') {
       const poll = job.poll;
       const name = `${poll.subject} · ${poll.level} — ${poll.question}`;
-      await sock.sendMessage(channelJid, {
-        poll: { name, values: poll.options, selectableCount: 1 },
-      });
+      if (job.format === 'quiz') {
+        await sock.relayMessage(channelJid, createNativeQuizMessage({ name, options: poll.options, answerIndex: poll.answerIndex }), {
+          messageId: generateMessageIDV2(sock.user?.id),
+        });
+      } else if (job.format === 'question') {
+        const openQuestion = `${poll.subject} · ${poll.level} — ${poll.question}`.slice(0, 255);
+        await sock.relayMessage(channelJid, createNativeQuestionMessage(openQuestion), {
+          messageId: generateMessageIDV2(sock.user?.id),
+          additionalAttributes: { type: 'question' },
+        });
+      } else {
+        await sock.sendMessage(channelJid, {
+          poll: { name, values: poll.options, selectableCount: 1 },
+        });
+      }
       publishedQuizAnswers.push({ dateKey: job.dateKey, ...poll });
       publishedQuizAnswers = publishedQuizAnswers.slice(-50);
-      logAdminEvent('sondage publié', ADMIN_JID, `${poll.subject}; ${poll.level}; ${job.id}`);
+      logAdminEvent(`${job.format || 'poll'} natif publié`, ADMIN_JID, `${poll.subject}; ${poll.level}; ${job.id}`);
     } else if (job.kind === 'recap') {
       const answers = publishedQuizAnswers.filter((item) => item.dateKey === job.dateKey);
       await sock.sendMessage(channelJid, { text: buildDailyRecap(job.dateKey, answers, POLL_TIMEZONE) });
@@ -526,7 +540,8 @@ function formatPollPreview() {
   if (!polls.length) return 'Aucun sondage en file. Active le programme avec !sondages on.';
   return `Aperçu des sondages programmés :\n${polls.map((job) => {
     const poll = job.poll;
-    return `\n${new Date(job.scheduledAt).toLocaleString('fr-FR', { timeZone: POLL_TIMEZONE })} · ${poll.subject} (${poll.level})\n${poll.question}\n${poll.options.map((option, index) => `${index + 1}. ${option}`).join('\n')}\nRéponse : ${poll.options[poll.answerIndex]}\n${poll.explanation}`;
+    const formatName = { poll: 'Sondage natif', quiz: 'Quiz natif', question: 'Question native' }[job.format || 'poll'];
+    return `\n${new Date(job.scheduledAt).toLocaleString('fr-FR', { timeZone: POLL_TIMEZONE })} · ${formatName} · ${poll.subject} (${poll.level})\n${poll.question}\n${poll.options.map((option, index) => `${index + 1}. ${option}`).join('\n')}\nRéponse : ${poll.options[poll.answerIndex]}\n${poll.explanation}`;
   }).join('\n')}`;
 }
 
@@ -555,6 +570,7 @@ async function ensureDailyPollJobs() {
     const newJobs = polls.map((poll, index) => ({
       id: `quiz-${targetDate}-${index + 1}`,
       kind: 'poll',
+      format: DAILY_INTERACTION_FORMATS[index],
       dateKey: targetDate,
       poll,
       scheduledAt: localDateTime(targetDate, POLL_TIMES[index], POLL_TIMEZONE).toISOString(),
@@ -604,7 +620,7 @@ async function handleControlCommand(msg, jid, text, fromAdmin) {
       channelPollsEnabled = true;
       persistRuntime();
       logAdminEvent('sondages automatiques activés', jid, `${channelJid}; ${channelScheduleLabel()}`);
-      await sock.sendMessage(jid, { text: `✅ Programme activé pour ${channelJid}. Cinq sondages par jour aux horaires ${channelScheduleLabel()}, puis un corrigé avec les liens Mathsfor.all 30 minutes après le dernier. Commandes : !sondages aperçu, !sondages off.` });
+      await sock.sendMessage(jid, { text: `✅ Programme activé pour ${channelJid}. Cinq publications natives WhatsApp par jour (2 Quiz, 2 Sondages, 1 Question) aux horaires ${channelScheduleLabel()}, puis un corrigé avec les liens Mathsfor.all 30 minutes après le dernier. Commandes : !sondages aperçu, !sondages off.` });
       ensureDailyPollJobs().catch((e) => notifyAdmin(`❌ Préparation des sondages impossible : ${e?.message || e}`));
     } else if (action === 'off') {
       channelPollsEnabled = false;
