@@ -21,6 +21,10 @@ const OWNER = (process.env.OWNER_NUMBER || '').replace(/\D/g, '');
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const REPLY_IN_GROUPS = (process.env.REPLY_IN_GROUPS || 'false').toLowerCase() === 'true';
 
+// Numéro qui reçoit les alertes de dépôt et donne la permission
+const ADMIN_NUMBER = (process.env.ADMIN_NUMBER || '237698877771').replace(/\D/g, '');
+const ADMIN_JID = ADMIN_NUMBER + '@s.whatsapp.net';
+
 const GEMINI_MODELS = [
   process.env.GEMINI_MODEL,
   'gemini-2.5-flash',
@@ -29,16 +33,30 @@ const GEMINI_MODELS = [
   'gemini-3.8-flash',
 ].filter(Boolean);
 
-const DEFAULT_SYSTEM_PROMPT = `Tu es un professeur de Maths et Physique pour les classes de Seconde, Première et Terminale au Cameroun.
-Tu expliques clairement, tu donnes des exemples simples, et tu encourages l'élève.
-Réponds toujours en français ou en anglais selon la langue du message reçu, de façon courte et adaptée à WhatsApp.
+// === Prompt : UNIQUEMENT connaissances site CMR SCHOOL ===
+const DEFAULT_SYSTEM_PROMPT = `Tu es l'agent officiel de CMR SCHOOL (https://cmr-school.online).
+Tu réponds uniquement à propos de CMR SCHOOL, ses offres, tarifs, inscription, paiement et fonctionnement.
+Style : français ou anglais selon le message, court, clair, adapté à WhatsApp. Tu es professionnel et encourageant.
 
-Tu peux analyser des images (exercices, énoncés) envoyées par l'élève.
-Quand on te demande une fiche, un cours structuré ou un PDF, rédige un contenu clair et bien organisé (titres, points clés, exemples).
+=== CONNAISSANCES AUTORISÉES (ne sors pas de ce cadre) ===
+Site : https://cmr-school.online
+Slogan : Comprendre. Progresser. Réussir. / Comprendre aujourd'hui. Réussir demain.
+Public : élèves Seconde, Première, Terminale (Cameroun) — Maths, Physique, Chimie.
+Canaux : Web, WhatsApp, Telegram.
 
-Tu es l'agent officiel de https://cmr-school.online.
-Offres : CMR Fiches, CMR Répétitions (dès ~20 000 FCFA/mois selon classe), CMR Pack.
-Contact : WhatsApp +237 677 152 300. Paiement PayPal ou Mobile Money (instructions via WhatsApp).`;
+Offres :
+1) CMR Fiches — supports structurés chapitre par chapitre, livraison WhatsApp ou Telegram. Paiement PayPal sécurisé sur le site. Pour MTN MoMo / Orange Money : contacter WhatsApp avant tout versement.
+2) CMR Répétitions — 3 séances/semaine · 2 h 30, Maths/Physique/Chimie, jusqu'à 4 séances avant examens. Tarifs indicatifs : ~20 000 FCFA/mois (2nde), ~30 000 (1ère), ~40 000 (Tle). Le conseiller confirme le montant exact.
+3) CMR Pack — fiches + répétitions, suivi parent possible, prix négociable dès 3 enfants.
+
+Contact inscription / Mobile Money : WhatsApp +237 677 152 300.
+Méthode : identifier le besoin → bon support → ancrer les progrès.
+
+=== RÈGLES ===
+- Si la question n'a AUCUN lien avec CMR SCHOOL / le site / l'inscription / le paiement : dis poliment que tu es l'assistant CMR SCHOOL et propose de parler des offres ou du site.
+- Tu n'inventes pas d'autres tarifs, numéros ou services hors de cette fiche.
+- Tu ne confirmes JAMAIS qu'un paiement est validé tant que l'administrateur ne t'a pas donné la permission (géré automatiquement par le système).
+- Pour les questions pédagogiques générales hors CMR SCHOOL, oriente vers les répétitions / fiches CMR SCHOOL.`;
 
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT;
 
@@ -55,13 +73,72 @@ function storeMsg(msg) {
 }
 
 const langByJid = new Map();
+
+// Dépôts en attente de validation admin : clientPhone -> { jid, at }
+const pendingDeposits = new Map();
+
 function detectLang(text) {
   const t = (text || '').toLowerCase();
-  const en = /\b(the|what|how|why|please|explain|solve|help|hello|hi)\b/;
-  const fr = /\b(le|la|les|des|une|est|pour|avec|comment|pourquoi|explique|bonjour|salut)\b/;
+  const en = /\b(the|what|how|why|please|help|hello|hi|payment|deposit)\b/;
+  const fr = /\b(le|la|les|des|une|est|pour|avec|comment|bonjour|salut|dépôt|depot|paiement|payé)\b/;
   if (en.test(t) && !fr.test(t)) return 'en';
   if (fr.test(t)) return 'fr';
   return null;
+}
+
+/** Le client affirme avoir payé / déposé */
+function isDepositClaim(text) {
+  const t = (text || '').toLowerCase();
+  return /(
+    d[eé]pos[eé]|j'?ai (pay[eé]|vers[eé]|envoy[eé])|
+    paiement (effectu[eé]|fait|ok|reussi|r[eé]ussi)|
+    (momo|orange money|om|mtn).{0,20}(envoy|pay|d[eé]pos)|
+    (envoy|pay|d[eé]pos).{0,20}(momo|orange|om|mtn)|
+    j'?ai effectu[eé].{0,30}(d[eé]p[oô]t|paiement|transfert)|
+    souscription (pay[eé]e|effectu[eé]e)|
+    i (paid|sent|transferred|deposited)|
+    payment (done|sent|completed)
+  )/i.test(t);
+}
+
+/** Message admin : validation ou refus */
+function parseAdminDecision(text) {
+  const t = (text || '').trim().toLowerCase();
+  // Formats : "ok 2376..." | "valider 2376..." | "oui 2376..." | "non 2376..." | "refuser 2376..."
+  const m = t.match(/\b(ok|oui|valider?|confirm(?:e|er)?|yes|approve)\s*[:\-]?\s*(\d{8,15})\b/i);
+  if (m) return { decision: 'approve', phone: m[2].replace(/\D/g, '') };
+  const r = t.match(/\b(non|refuser?|reject|no)\s*[:\-]?\s*(\d{8,15})\b/i);
+  if (r) return { decision: 'reject', phone: r[2].replace(/\D/g, '') };
+  // "ok" seul si un seul pending
+  if (/^(ok|oui|valider?|yes)$/i.test(t) && pendingDeposits.size === 1) {
+    const phone = pendingDeposits.keys().next().value;
+    return { decision: 'approve', phone };
+  }
+  if (/^(non|refuser?|no)$/i.test(t) && pendingDeposits.size === 1) {
+    const phone = pendingDeposits.keys().next().value;
+    return { decision: 'reject', phone };
+  }
+  return null;
+}
+
+function jidToPhone(jid) {
+  if (!jid) return '';
+  // @s.whatsapp.net
+  const m = String(jid).match(/^(\d+)@/);
+  if (m) return m[1];
+  // @lid — on ne peut pas déduire le PN ; on garde un id lisible
+  if (String(jid).includes('@lid')) return 'LID:' + String(jid).split('@')[0];
+  return String(jid).replace(/\D/g, '') || jid;
+}
+
+function phoneToJid(phone) {
+  return String(phone).replace(/\D/g, '') + '@s.whatsapp.net';
+}
+
+function isAdminJid(jid) {
+  if (!jid) return false;
+  const p = jidToPhone(jid);
+  return p === ADMIN_NUMBER || jid === ADMIN_JID;
 }
 
 let genAI = null;
@@ -71,6 +148,8 @@ if (GEMINI_KEY) {
   activeModelName = GEMINI_MODELS[0];
   console.log('[OK] Gemini —', GEMINI_MODELS.join(' → '));
 } else console.log('[WARN] GEMINI_API_KEY absente');
+
+console.log('[OK] ADMIN alertes dépôt:', ADMIN_NUMBER);
 
 function getModel(name) {
   return genAI.getGenerativeModel({ model: name, systemInstruction: SYSTEM_PROMPT });
@@ -104,28 +183,12 @@ async function askAI(userMessage, lang) {
   }
   const prefix =
     lang === 'en'
-      ? 'Reply in English. Short WhatsApp style.\n\n'
-      : 'Réponds en français. Style WhatsApp court.\n\n';
+      ? 'Reply in English. Short WhatsApp style. Stay strictly on CMR SCHOOL topics.\n\n'
+      : 'Réponds en français. Style WhatsApp court. Reste strictement sur CMR SCHOOL.\n\n';
   try {
     return await generateWithFallback(prefix + userMessage);
   } catch (e) {
     return 'Erreur IA: ' + String(e.message).slice(0, 160);
-  }
-}
-
-async function askAIWithImage(caption, buffer, mimeType, lang) {
-  if (!genAI) return askAI(caption || 'Analyse image', lang);
-  const prefix =
-    lang === 'en'
-      ? 'Analyze this exercise image. English, short.\n'
-      : 'Analyse cette image d\'exercice. Français, court.\n';
-  try {
-    return await generateWithFallback([
-      prefix + (caption || ''),
-      { inlineData: { data: buffer.toString('base64'), mimeType: mimeType || 'image/jpeg' } },
-    ]);
-  } catch (e) {
-    return askAI((caption || '') + '\n[vision échouée]', lang);
   }
 }
 
@@ -151,7 +214,6 @@ function getMediaType(msg) {
   if (!m) return null;
   if (m.imageMessage) return 'image';
   if (m.documentMessage || m.documentWithCaptionMessage?.message?.documentMessage) return 'document';
-  if (m.videoMessage) return 'video';
   return null;
 }
 
@@ -162,10 +224,9 @@ function isBroadcast(jid) {
   return !jid || jid === 'status@broadcast' || jid.endsWith('@broadcast') || jid.endsWith('@newsletter');
 }
 
-/** Demande explicite de fiche / PDF */
 function wantsPdf(text) {
   const t = (text || '').toLowerCase();
-  return /\b(pdf|fiche|fichier|document|export)\b/.test(t);
+  return /\b(pdf|fiche|fichier|document)\b/.test(t);
 }
 
 let sock = null;
@@ -183,44 +244,49 @@ function scheduleReconnect(ms, reason) {
   }, ms);
 }
 
+/** Notifie l'admin qu'un client affirme avoir déposé */
+async function notifyAdminDeposit(clientPhone, clientJid) {
+  const displayPhone = String(clientPhone).startsWith('237')
+    ? clientPhone
+    : clientPhone;
+
+  const adminMsg =
+    `Le client de numéro ${displayPhone} affirme avoir effectué un dépôt d'argent sur l'un de vos numéros de téléphone, veuillez vérifier et me donner la permission de lui confirmer le succès de sa souscription.\n\n` +
+    `Pour valider : ok ${displayPhone}\n` +
+    `Pour refuser : non ${displayPhone}`;
+
+  pendingDeposits.set(String(clientPhone).replace(/\D/g, '') || clientPhone, {
+    jid: clientJid,
+    at: Date.now(),
+  });
+
+  await sock.sendMessage(ADMIN_JID, { text: adminMsg });
+  console.log('[DEPOT] Alerte envoyée à', ADMIN_NUMBER, 'pour client', displayPhone);
+}
+
 const app = express();
 app.get('/', (req, res) => {
   res.type('html').send(`
     <h2>${BOT_NAME}</h2>
     <p>WhatsApp: <b>${waReady ? 'CONNECTÉ' : 'hors ligne'}</b></p>
-    <p>Gemini: <b>${genAI ? 'OK (' + (activeModelName || '?') + ')' : 'NON'}</b></p>
-    <p><a href="/health">/health</a> · <a href="/test-send">/test-send</a></p>
+    <p>Admin dépôts: <b>${ADMIN_NUMBER}</b></p>
+    <p>Pending: ${pendingDeposits.size}</p>
   `);
 });
 app.get('/health', (req, res) =>
-  res.json({ status: 'ok', whatsapp: waReady, gemini: !!genAI, model: activeModelName, owner: OWNER || null })
+  res.json({
+    status: 'ok',
+    whatsapp: waReady,
+    admin: ADMIN_NUMBER,
+    pendingDeposits: pendingDeposits.size,
+  })
 );
-app.get('/test-send', async (req, res) => {
-  try {
-    if (!sock || !waReady) return res.status(503).json({ ok: false, error: 'WhatsApp offline' });
-    const text = (req.query.text || `Test ${BOT_NAME}`).toString();
-    let jid = (req.query.to || '').toString().replace(/\D/g, '');
-    if (jid) jid += '@s.whatsapp.net';
-    else if (lastIncomingJid) jid = lastIncomingJid;
-    else if (OWNER) jid = OWNER + '@s.whatsapp.net';
-    else return res.status(400).json({ ok: false, error: 'to= required' });
-    await sock.sendMessage(jid, { text });
-    res.json({ ok: true, to: jid });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
 app.listen(PORT, () => console.log('[OK] HTTP port', PORT));
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
-  console.log(
-    '[OK] Baileys', version.join('.'),
-    '| OWNER=', OWNER || '(vide)',
-    '| registered=', !!state.creds?.registered
-  );
-  if (!OWNER) console.log('[WARN] OWNER_NUMBER vide → pairing impossible');
+  console.log('[OK] Baileys', version.join('.'), '| OWNER=', OWNER || '(vide)', '| ADMIN=', ADMIN_NUMBER);
 
   sock = makeWASocket({
     version,
@@ -245,19 +311,12 @@ async function startBot() {
       pairingRequested = true;
       setTimeout(async () => {
         try {
-          console.log('[INFO] Demande pairing pour WhatsApp (Business OK) numéro:', OWNER);
           const code = await sock.requestPairingCode(OWNER);
           const pretty = code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
-          console.log('\n========================================');
-          console.log('  CODE DE PAIRING :', pretty);
-          console.log('========================================');
-          console.log('WhatsApp Business > Paramètres > Appareils connectés');
-          console.log('> Connecter un appareil > Lier avec un numéro');
-          console.log('Entre le code en moins d\'1 minute.\n');
+          console.log('\n*** CODE DE PAIRING:', pretty, '***\n');
         } catch (e) {
           pairingRequested = false;
-          console.error('[ERR] pairing:', e.message);
-          console.log('[TIP] Vérifie OWNER_NUMBER = numéro Business sans + (ex 2376...)');
+          console.error('[ERR] pairing', e.message);
         }
       }, 5000);
     }
@@ -266,28 +325,24 @@ async function startBot() {
       waReady = false;
       const status = lastDisconnect?.error?.output?.statusCode;
       if (status === 515) {
-        console.log('[INFO] 515 restartRequired (normal après pairing)');
         pairingRequested = false;
         scheduleReconnect(2500, '515');
         return;
       }
       if (status === DisconnectReason.loggedOut || status === 401) {
-        console.log('[ERR] loggedOut — re-pairer le numéro Business');
+        console.log('[ERR] loggedOut');
         pairingRequested = false;
         return;
       }
-      console.log('[WARN] close', status);
       pairingRequested = false;
       scheduleReconnect(4000, 'close');
     } else if (connection === 'open') {
       waReady = true;
-      console.log(`[OK] ${BOT_NAME} CONNECTÉ`);
+      console.log(`[OK] ${BOT_NAME} CONNECTÉ | alertes dépôt → ${ADMIN_NUMBER}`);
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    console.log('[MSG] type=', type, 'n=', messages?.length || 0);
-
+  sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages || []) {
       try {
         storeMsg(msg);
@@ -298,104 +353,149 @@ async function startBot() {
         if (isGroupJid(jid) && !REPLY_IN_GROUPS) continue;
 
         const text = extractText(msg).trim();
-        const mediaType = getMediaType(msg);
-        console.log('[MSG]', jid, mediaType, JSON.stringify(text.slice(0, 60)));
+        if (!text && !getMediaType(msg)) continue;
 
-        if (!text && !mediaType) continue;
         lastIncomingJid = jid;
+        let lang = langByJid.get(jid) || detectLang(text) || 'fr';
+        if (detectLang(text)) langByJid.set(jid, detectLang(text));
 
-        let lang = langByJid.get(jid);
-        const det = detectLang(text);
-        if (det) {
-          lang = det;
-          langByJid.set(jid, lang);
+        const lower = (text || '').toLowerCase();
+
+        // ---------- ADMIN : validation / refus dépôt ----------
+        if (isAdminJid(jid) && text) {
+          const decision = parseAdminDecision(text);
+          if (decision) {
+            const key = decision.phone;
+            const pending = pendingDeposits.get(key);
+            // Aussi chercher si le numéro est stocké avec/sans 237
+            let entry = pending;
+            let foundKey = key;
+            if (!entry) {
+              for (const [k, v] of pendingDeposits) {
+                if (k.endsWith(key) || key.endsWith(k)) {
+                  entry = v;
+                  foundKey = k;
+                  break;
+                }
+              }
+            }
+
+            if (!entry) {
+              await sock.sendMessage(jid, {
+                text: `Aucun dépôt en attente pour ${key}.\nEn attente: ${[...pendingDeposits.keys()].join(', ') || 'aucun'}`,
+              });
+              continue;
+            }
+
+            if (decision.decision === 'approve') {
+              await sock.sendMessage(entry.jid, {
+                text:
+                  lang === 'en' || false
+                    ? '✅ Your payment has been confirmed. Welcome to CMR SCHOOL! We will contact you for the next steps.\nhttps://cmr-school.online'
+                    : '✅ Votre paiement a été confirmé. Bienvenue chez CMR SCHOOL ! Nous vous recontactons pour la suite.\nhttps://cmr-school.online',
+              });
+              await sock.sendMessage(jid, {
+                text: `✅ Client ${foundKey} : souscription confirmée.`,
+              });
+              pendingDeposits.delete(foundKey);
+              console.log('[DEPOT] VALIDÉ', foundKey);
+            } else {
+              await sock.sendMessage(entry.jid, {
+                text:
+                  '❌ Nous n\'avons pas encore retrouvé votre dépôt. Merci de vérifier le numéro / montant ou d\'envoyer la capture du transfert, puis réécrivez-nous.',
+              });
+              await sock.sendMessage(jid, {
+                text: `❌ Client ${foundKey} : dépôt non confirmé (refusé).`,
+              });
+              pendingDeposits.delete(foundKey);
+              console.log('[DEPOT] REFUSÉ', foundKey);
+            }
+            continue;
+          }
+          // Admin peut aussi poser des questions normales → tombe dans le flux IA
         }
-        if (!lang) lang = 'fr';
 
-        const lower = text.toLowerCase();
+        // ---------- CLIENT : affirmation de dépôt ----------
+        if (text && isDepositClaim(text) && !isAdminJid(jid)) {
+          const clientPhone = jidToPhone(jid);
+          try {
+            await notifyAdminDeposit(clientPhone, jid);
+            await sock.sendMessage(jid, {
+              text:
+                lang === 'en'
+                  ? 'Thank you. We have notified the team to verify your payment. You will receive a confirmation shortly.'
+                  : 'Merci. Nous avons informé l\'équipe pour vérifier votre dépôt. Vous recevrez une confirmation sous peu.',
+            });
+          } catch (e) {
+            console.error('[ERR] notify admin', e.message);
+            await sock.sendMessage(jid, {
+              text:
+                'Votre message est bien reçu. Un conseiller va vérifier le paiement manuellement. Contact : +237 677 152 300',
+            });
+          }
+          continue;
+        }
+
         if (lower === 'ping') {
           await sock.sendMessage(jid, { text: 'Pong ✅' });
           continue;
         }
         if (lower === 'menu' || lower === 'aide' || lower === 'help') {
           await sock.sendMessage(jid, {
-            text:
-              lang === 'en'
-                ? `*${BOT_NAME}*\nQuestions, photos d'exercices, "fiche PDF dérivées"...\nhttps://cmr-school.online`
-                : `*${BOT_NAME}*\nQuestions, photos d'exercices.\nPour un PDF : "fiche PDF dérivées Terminale"\nhttps://cmr-school.online`,
+            text: `*${BOT_NAME}* — https://cmr-school.online\n\nJe réponds sur :\n• Offres (Fiches, Répétitions, Pack)\n• Tarifs & inscription\n• Paiement / Mobile Money\n\nSi vous avez déjà payé, écrivez par ex. : "J'ai effectué un dépôt".`,
           });
           continue;
         }
 
         await sock.sendPresenceUpdate('composing', jid).catch(() => {});
 
-        if (mediaType === 'image') {
+        // Médias : on reste dans le cadre site (légende = question sur CMR)
+        if (getMediaType(msg) === 'image') {
           const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
             logger,
             reuploadRequest: sock.updateMediaMessage,
           });
-          const mime = msg.message.imageMessage?.mimetype || 'image/jpeg';
-          const reply = await askAIWithImage(text, buffer, mime, lang);
-          await sock.sendMessage(jid, { text: reply });
-          continue;
-        }
-
-        if (mediaType === 'document') {
-          const doc =
-            msg.message.documentMessage ||
-            msg.message.documentWithCaptionMessage?.message?.documentMessage;
-          const fileName = doc?.fileName || 'fichier';
-          const mime = doc?.mimetype || '';
-          const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
-            logger,
-            reuploadRequest: sock.updateMediaMessage,
-          });
-          if (mime.startsWith('image/')) {
-            const reply = await askAIWithImage(text || fileName, buffer, mime, lang);
-            await sock.sendMessage(jid, { text: reply });
-          } else if (mime.includes('text') || /\.(txt|md)$/i.test(fileName)) {
-            const content = buffer.toString('utf8').slice(0, 12000);
-            const reply = await askAI(`Fichier ${fileName}:\n${content}\n\n${text || 'Aide'}`, lang);
-            await sock.sendMessage(jid, { text: reply });
-          } else {
-            const reply = await askAI(
-              `Document "${fileName}" reçu. ${text || 'Demande une photo des pages utiles.'}`,
-              lang
-            );
-            await sock.sendMessage(jid, { text: reply });
+          // Si la légende ressemble à un dépôt (capture MoMo), traiter comme dépôt
+          if (isDepositClaim(text) || /momo|orange|reçu|recu|transfert|deposit|payment/i.test(text || '')) {
+            const clientPhone = jidToPhone(jid);
+            await notifyAdminDeposit(clientPhone, jid);
+            await sock.sendMessage(jid, {
+              text:
+                'Merci pour la capture. L\'équipe vérifie votre dépôt et vous confirmera sous peu.',
+            });
+            continue;
           }
+          const reply = await askAI(
+            `L'utilisateur a envoyé une image avec légende: "${text || '(aucune)'}". Réponds uniquement dans le cadre CMR SCHOOL / inscription / paiement.`,
+            lang
+          );
+          await sock.sendMessage(jid, { text: reply });
           continue;
         }
 
         if (!text) continue;
 
-        // Contenu plus riche si demande PDF/fiche
         const prompt = wantsPdf(text)
-          ? text +
-            '\n\nRédige une fiche complète et structurée (titres, points, exemples), prête à mettre en PDF.'
+          ? text + '\n\nRédige une fiche claire sur ce sujet lié à CMR SCHOOL si pertinent, sinon présente les offres.'
           : text;
 
         const reply = await askAI(prompt, lang);
 
         if (wantsPdf(text) && reply.length > 60) {
           try {
-            const title = (text.slice(0, 60) || 'Fiche CMR SCHOOL').replace(/\n/g, ' ');
-            const pdfBuf = await textToPdf(title, reply);
+            const pdfBuf = await textToPdf(text.slice(0, 50), reply);
             await sock.sendMessage(jid, {
               document: pdfBuf,
               mimetype: 'application/pdf',
-              fileName: `fiche-cmr-school-${Date.now()}.pdf`,
-              caption: lang === 'en' ? 'Your PDF sheet' : 'Ta fiche PDF CMR SCHOOL',
+              fileName: `cmr-school-${Date.now()}.pdf`,
+              caption: 'Document CMR SCHOOL',
             });
-            console.log('[MSG] PDF envoyé');
           } catch (e) {
-            console.error('[ERR] PDF', e.message);
             await sock.sendMessage(jid, { text: reply });
           }
         } else {
           await sock.sendMessage(jid, { text: reply });
         }
-        console.log('[MSG] ENVOYÉ OK');
       } catch (err) {
         console.error('[ERR] handler', err?.message || err);
       }
