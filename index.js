@@ -25,7 +25,7 @@ const {
   parseGeneratedPollBatch,
   parsePollTimes,
 } = require('./lib/channel-polls');
-const { parseAdminNumbers } = require('./lib/admin-numbers');
+const { canPublishToChannel, parseAdminNumbers } = require('./lib/admin-numbers');
 
 const PORT = process.env.PORT || 3000;
 const BOT_NAME = process.env.BOT_NAME || 'CMR SCHOOL';
@@ -240,6 +240,14 @@ function isAdminJid(jid) {
   return ADMIN_NUMBERS.includes(jidToPhone(jid));
 }
 
+function connectedAccountPhone() {
+  const userId = String(sock?.user?.id || '');
+  const socketPhone = /@(s\.whatsapp\.net|c\.us)$/.test(userId)
+    ? userId.split('@')[0].split(':')[0].replace(/\D/g, '')
+    : '';
+  return /^\d{8,15}$/.test(socketPhone) ? socketPhone : OWNER;
+}
+
 let genAI = null;
 let activeModelName = null;
 if (GEMINI_KEY) {
@@ -428,8 +436,9 @@ async function resolveChannelMetadata() {
   }
   channelJid = metadata.id;
   channelRole = String(metadata.viewer_metadata?.role || metadata.role || '').toUpperCase();
-  channelCanPost = channelRole === 'ADMIN' || channelRole === 'OWNER';
-  console.log('[CHANNEL] résolu', channelJid, '| rôle =', channelRole || 'inconnu');
+  const linkedPhone = connectedAccountPhone();
+  channelCanPost = canPublishToChannel(channelRole, linkedPhone, ADMIN_NUMBERS);
+  console.log('[CHANNEL] résolu', channelJid, '| rôle =', channelRole || 'inconnu', '| autorisation =', channelCanPost ? (channelRole ? 'WhatsApp' : `liste admin (${linkedPhone})`) : 'refusée');
   return metadata;
 }
 
@@ -614,7 +623,8 @@ async function handleControlCommand(msg, jid, text, fromAdmin) {
       await sock.sendMessage(jid, { text: formatPollPreview() });
     } else {
       const count = scheduledPollJobs.filter((job) => job.kind === 'poll').length;
-      await sock.sendMessage(jid, { text: `Sondages automatiques : ${channelPollsEnabled ? 'ACTIFS' : 'inactifs'}\nCanal : ${channelJid || CHANNEL_URL}\nRôle du compte : ${channelRole || 'non vérifié'}\nHoraires : ${channelScheduleLabel()}\nQuiz en attente : ${count}\n${channelPollsEnabled ? 'Désactiver : !sondages off' : 'Activer : !sondages on'}` });
+      const roleStatus = channelRole || (channelCanPost ? 'inconnu — autorisé par la liste admin configurée' : 'non vérifié');
+      await sock.sendMessage(jid, { text: `Sondages automatiques : ${channelPollsEnabled ? 'ACTIFS' : 'inactifs'}\nCanal : ${channelJid || CHANNEL_URL}\nRôle du compte : ${roleStatus}\nHoraires : ${channelScheduleLabel()}\nQuiz en attente : ${count}\n${channelPollsEnabled ? 'Désactiver : !sondages off' : 'Activer : !sondages on'}` });
     }
     return true;
   }
