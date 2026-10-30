@@ -9,6 +9,8 @@ Agent IA WhatsApp **gratuit** — sans préfixe, prompt configurable, déploieme
 | `GEMINI_API_KEY` | Oui | Clé gratuite [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
 | `GEMINI_MODEL` | Non | Modèle primaire (défaut : `gemini-2.5-flash`) ; secours : Gemini 2.5 Flash puis 3.8 Flash, ensuite les modèles Flash Lite |
 | `OWNER_NUMBER` | Oui | Ton numéro WhatsApp sans `+` (ex: `2376XXXXXXXX`) |
+| `ADMIN_NUMBER` | Non | Numéro principal qui reçoit les alertes admin (défaut : `237698877771`) |
+| `ADMIN_NUMBERS` | Non | Numéros autorisés à toutes les commandes admin, séparés par des virgules (défaut : les deux admins du canal) |
 | `SYSTEM_PROMPT` | Recommandé | Rôle de l'agent **avant** la première utilisation |
 | `BOT_NAME` | Non | Nom du bot (défaut: CMR AI Agent) |
 | `PORT` | Non | Laissé à Render |
@@ -23,7 +25,7 @@ Si un modèle échoue, l’agent essaie le suivant dans cet ordre. Les modèles 
 
 ## Fonctions et commandes
 
-Les commandes admin sont accessibles uniquement depuis le numéro `ADMIN_NUMBER`.
+Les commandes admin sont accessibles depuis les numéros de `ADMIN_NUMBERS` (par défaut `237677152300` et `237698877771`). Les alertes et notifications de paiement continuent d’être envoyées au numéro principal `ADMIN_NUMBER`.
 
 - **Statuts avec aperçu obligatoire** : `statut: texte`, `statut connus: texte` ou `statut liste: texte`. Envoie une image ou une vidéo avec cette commande en légende pour préparer un statut média. Le bot affiche l’aperçu et l’audience ; `confirmer statut` publie, `annuler statut` abandonne. La légende est limitée à 700 caractères et le bot refuse les fichiers de plus de 64 Mo. WhatsApp limite les vidéos de statut à 90 secondes ([aide WhatsApp](https://faq.whatsapp.com/454876960047011)).
 - **Audience connue** : contacts directs ayant déjà écrit au bot. **Audience liste** : numéros indiqués dans `STATUS_RECIPIENTS`, séparés par des virgules, au format international sans `+`.

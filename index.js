@@ -25,6 +25,7 @@ const {
   parseGeneratedPollBatch,
   parsePollTimes,
 } = require('./lib/channel-polls');
+const { parseAdminNumbers } = require('./lib/admin-numbers');
 
 const PORT = process.env.PORT || 3000;
 const BOT_NAME = process.env.BOT_NAME || 'CMR SCHOOL';
@@ -32,6 +33,7 @@ const OWNER = (process.env.OWNER_NUMBER || '').replace(/\D/g, '');
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const REPLY_IN_GROUPS = (process.env.REPLY_IN_GROUPS || 'false').toLowerCase() === 'true';
 const ADMIN_NUMBER = (process.env.ADMIN_NUMBER || '237698877771').replace(/\D/g, '');
+const ADMIN_NUMBERS = parseAdminNumbers(process.env.ADMIN_NUMBERS || '237677152300,237698877771');
 const ADMIN_JID = ADMIN_NUMBER + '@s.whatsapp.net';
 const CHANNEL_URL = process.env.WHATSAPP_CHANNEL_URL || 'https://whatsapp.com/channel/0029VbC9sfi5q08hsj3JTp0W';
 const CHANNEL_INVITE_CODE = parseChannelInviteCode(CHANNEL_URL);
@@ -235,7 +237,7 @@ function jidToPhone(jid) {
 }
 
 function isAdminJid(jid) {
-  return jidToPhone(jid) === ADMIN_NUMBER || jid === ADMIN_JID;
+  return ADMIN_NUMBERS.includes(jidToPhone(jid));
 }
 
 let genAI = null;
@@ -245,7 +247,7 @@ if (GEMINI_KEY) {
   activeModelName = GEMINI_MODELS[0];
   console.log('[OK] Gemini —', GEMINI_MODELS.join(' → '));
 } else console.log('[WARN] GEMINI_API_KEY absente');
-console.log('[OK] ADMIN dépôts:', ADMIN_NUMBER);
+console.log('[OK] ADMIN commandes:', ADMIN_NUMBERS.join(', '), '| notifications:', ADMIN_NUMBER);
 
 function getModel(name, systemInstruction = SYSTEM_PROMPT) {
   return genAI.getGenerativeModel({ model: name, systemInstruction });
