@@ -24,12 +24,12 @@ const ADMIN_NUMBER = (process.env.ADMIN_NUMBER || '237698877771').replace(/\D/g,
 const ADMIN_JID = ADMIN_NUMBER + '@s.whatsapp.net';
 
 const GEMINI_MODELS = [
-  process.env.GEMINI_MODEL,
+  process.env.GEMINI_MODEL || 'gemini-2.5-flash',
   'gemini-2.5-flash',
+  'gemini-3.8-flash',
   'gemini-2.5-flash-lite',
   'gemini-3.1-flash-lite',
-  'gemini-3.8-flash',
-].filter(Boolean);
+].filter((name, index, models) => name && models.indexOf(name) === index);
 
 const DEFAULT_SYSTEM_PROMPT = `Tu es l'agent officiel de CMR SCHOOL (https://cmr-school.online).
 Tu réponds uniquement à propos de CMR SCHOOL, ses offres, tarifs, inscription, paiement et fonctionnement.

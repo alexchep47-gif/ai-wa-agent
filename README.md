@@ -7,12 +7,14 @@ Agent IA WhatsApp **gratuit** — sans préfixe, prompt configurable, déploieme
 | Variable | Obligatoire | Description |
 |----------|-------------|-------------|
 | `GEMINI_API_KEY` | Oui | Clé gratuite [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
+| `GEMINI_MODEL` | Non | Modèle primaire (défaut : `gemini-2.5-flash`) ; secours : Gemini 2.5 Flash puis 3.8 Flash, ensuite les modèles Flash Lite |
 | `OWNER_NUMBER` | Oui | Ton numéro WhatsApp sans `+` (ex: `2376XXXXXXXX`) |
 | `SYSTEM_PROMPT` | Recommandé | Rôle de l'agent **avant** la première utilisation |
 | `BOT_NAME` | Non | Nom du bot (défaut: CMR AI Agent) |
 | `PORT` | Non | Laissé à Render |
 
 Sur **Render**, tu ne crées pas de fichier `.env` : tu ajoutes chaque variable dans **Environment**.
+Si un modèle échoue, l’agent essaie le suivant dans cet ordre. Les modèles partagent le quota Gemini de ta clé/projet : un quota épuisé globalement peut bloquer toute la chaîne.
 
 ---
 
