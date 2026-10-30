@@ -25,7 +25,7 @@ const {
   parseGeneratedPollBatch,
   parsePollTimes,
 } = require('./lib/channel-polls');
-const { canPublishToChannel, parseAdminNumbers } = require('./lib/admin-numbers');
+const { canPublishToChannel, isAdminSender, parseAdminNumbers } = require('./lib/admin-numbers');
 
 const PORT = process.env.PORT || 3000;
 const BOT_NAME = process.env.BOT_NAME || 'CMR SCHOOL';
@@ -234,10 +234,6 @@ function jidToPhone(jid) {
   if (m) return m[1];
   if (String(jid).includes('@lid')) return 'LID:' + String(jid).split('@')[0];
   return String(jid).replace(/\D/g, '') || jid;
-}
-
-function isAdminJid(jid) {
-  return ADMIN_NUMBERS.includes(jidToPhone(jid));
 }
 
 function connectedAccountPhone() {
@@ -986,7 +982,10 @@ async function startBot() {
         if (det) langByJid.set(jid, det);
         const lang = langByJid.get(jid) || 'fr';
         const lower = (text || '').toLowerCase();
-        const fromAdmin = isAdminJid(jid);
+        const fromAdmin = isAdminSender(
+          [jid, msg.key.senderPn, msg.key.remoteJidAlt, msg.key.participantAlt],
+          ADMIN_NUMBERS,
+        );
 
         if (fromAdmin && text) {
           const decision = parseAdminDecision(text);
