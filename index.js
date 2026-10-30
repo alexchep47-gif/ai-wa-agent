@@ -73,27 +73,26 @@ function isDepositClaim(text) {
     /j'?ai vers/i,
     /j'?ai envoy/i,
     /j'?ai effectu/i,
-    /paiement/i,
+    /paiement effectu/i,
+    /souscription pay/i,
     /momo/i,
     /orange money/i,
-    /transfert/i,
     /i paid/i,
     /payment (done|sent|completed)/i,
   ].some((re) => re.test(t));
 }
 
+/**
+ * Validation admin UNIQUEMENT si le message contient
+ * explicitement : ok/non + numéro client
+ * (ex: "ok 2376xxxxxxxx"). Ainsi l'admin peut discuter librement.
+ */
 function parseAdminDecision(text) {
-  const t = (text || '').trim().toLowerCase();
-  const m = t.match(/\b(ok|oui|valider?|confirm(?:e|er)?|yes)\s*[:\-]?\s*(\d{8,15})\b/i);
+  const t = (text || '').trim();
+  const m = t.match(/^(ok|oui|valider?|confirm(?:e|er)?|yes)\s+(\d{8,15})\s*$/i);
   if (m) return { decision: 'approve', phone: m[2].replace(/\D/g, '') };
-  const r = t.match(/\b(non|refuser?|no)\s*[:\-]?\s*(\d{8,15})\b/i);
+  const r = t.match(/^(non|refuser?|no)\s+(\d{8,15})\s*$/i);
   if (r) return { decision: 'reject', phone: r[2].replace(/\D/g, '') };
-  if (/^(ok|oui|yes)$/i.test(t) && pendingDeposits.size === 1) {
-    return { decision: 'approve', phone: pendingDeposits.keys().next().value };
-  }
-  if (/^(non|no)$/i.test(t) && pendingDeposits.size === 1) {
-    return { decision: 'reject', phone: pendingDeposits.keys().next().value };
-  }
   return null;
 }
 
@@ -106,7 +105,8 @@ function jidToPhone(jid) {
 }
 
 function isAdminJid(jid) {
-  return jidToPhone(jid) === ADMIN_NUMBER || jid === ADMIN_JID;
+  const p = jidToPhone(jid);
+  return p === ADMIN_NUMBER || jid === ADMIN_JID;
 }
 
 let genAI = null;
@@ -116,7 +116,7 @@ if (GEMINI_KEY) {
   activeModelName = GEMINI_MODELS[0];
   console.log('[OK] Gemini —', GEMINI_MODELS.join(' → '));
 } else console.log('[WARN] GEMINI_API_KEY absente');
-console.log('[OK] ADMIN dépôts:', ADMIN_NUMBER);
+console.log('[OK] ADMIN dépôts (peut aussi discuter):', ADMIN_NUMBER);
 
 function getModel(name) {
   return genAI.getGenerativeModel({ model: name, systemInstruction: SYSTEM_PROMPT });
@@ -213,7 +213,8 @@ async function notifyAdminDeposit(clientPhone, clientJid) {
     'Pour valider : ok ' +
     displayPhone +
     '\nPour refuser : non ' +
-    displayPhone;
+    displayPhone +
+    '\n\n(Tu peux aussi m\'\u00e9crire normalement pour toute autre question CMR SCHOOL.)';
   const key = String(clientPhone).replace(/\D/g, '') || clientPhone;
   pendingDeposits.set(key, { jid: clientJid, at: Date.now() });
   await sock.sendMessage(ADMIN_JID, { text: adminMsg });
@@ -245,8 +246,8 @@ async function startBot() {
 
   console.log('----------------------------------------');
   console.log('[BOOT]', myBoot, '| Baileys', version.join('.'));
-  console.log('[BOOT] OWNER_NUMBER =', OWNER || '(VIDE — pairing impossible)');
-  console.log('[BOOT] registered (session sauvée) =', registered);
+  console.log('[BOOT] OWNER_NUMBER =', OWNER || '(VIDE)');
+  console.log('[BOOT] registered =', registered);
   console.log('----------------------------------------');
 
   sock = makeWASocket({
@@ -267,36 +268,22 @@ async function startBot() {
 
   sock.ev.on('connection.update', async (update) => {
     if (myBoot !== bootId) return;
-    const { connection, lastDisconnect, qr } = update;
-
+    const { connection, lastDisconnect } = update;
     if (connection) console.log('[CONN] état =', connection);
 
-    // Pairing uniquement si pas encore enregistré
     if (!sock.authState.creds.registered && OWNER && !pairingRequested) {
       pairingRequested = true;
       setTimeout(async () => {
-        if (myBoot !== bootId) return;
-        if (sock.authState.creds.registered) {
-          console.log('[PAIR] Déjà registered, pas de nouveau code');
-          return;
-        }
+        if (myBoot !== bootId || sock.authState.creds.registered) return;
         try {
-          console.log('[PAIR] Demande code pour', OWNER, '(WhatsApp Business OK)');
           const code = await sock.requestPairingCode(OWNER);
           const pretty = code.length === 8 ? code.slice(0, 4) + '-' + code.slice(4) : code;
-          console.log('');
-          console.log('******** CODE DE PAIRING ********');
+          console.log('\n******** CODE DE PAIRING ********');
           console.log('         ', pretty);
-          console.log('********************************');
-          console.log('WhatsApp Business > Paramètres > Appareils connectés');
-          console.log('> Connecter un appareil > Lier avec un numéro');
-          console.log('Entre ce code en MOINS d\'1 minute');
-          console.log('Ensuite attends: [CONN] état = open  puis  CONNECTÉ');
-          console.log('');
+          console.log('********************************\n');
         } catch (e) {
           pairingRequested = false;
           console.error('[PAIR] ERREUR:', e.message);
-          console.log('[PAIR] Vérifie OWNER_NUMBER = numéro Business sans + ni espace');
         }
       }, 6000);
     }
@@ -304,38 +291,21 @@ async function startBot() {
     if (connection === 'close') {
       waReady = false;
       const status = lastDisconnect?.error?.output?.statusCode;
-      const msg = lastDisconnect?.error?.message || '';
-      console.log('[CONN] FERMÉ status=', status, '|', msg.slice(0, 80));
-
+      console.log('[CONN] FERMÉ status=', status);
       if (status === 515) {
-        console.log('[CONN] 515 = normal APRÈS un pairing réussi. Relance pour finaliser...');
         pairingRequested = false;
-        scheduleReconnect(3000, '515 post-pairing');
+        scheduleReconnect(3000, '515');
         return;
       }
-      if (status === DisconnectReason.loggedOut || status === 401) {
-        console.log('[CONN] Session invalidée. Supprime les appareils liés sur le téléphone et re-pair.');
-        pairingRequested = false;
-        return;
-      }
-      if (status === 440) {
-        console.log('[CONN] 440 = appareil remplacé ailleurs. Re-pair nécessaire.');
+      if (status === DisconnectReason.loggedOut || status === 401 || status === 440) {
         pairingRequested = false;
         return;
       }
       pairingRequested = false;
-      scheduleReconnect(5000, 'close ' + status);
+      scheduleReconnect(5000, 'close');
     } else if (connection === 'open') {
       waReady = true;
-      console.log('');
-      console.log('========================================');
-      console.log('  [OK] CONNECTÉ À WHATSAPP');
-      console.log('  Bot:', BOT_NAME);
-      console.log('  Alertes dépôt →', ADMIN_NUMBER);
-      console.log('========================================');
-      console.log('');
-    } else if (connection === 'connecting') {
-      console.log('[CONN] Connexion en cours...');
+      console.log('\n[OK] CONNECTÉ À WHATSAPP | admin=', ADMIN_NUMBER, '\n');
     }
   });
 
@@ -356,8 +326,10 @@ async function startBot() {
         if (det) langByJid.set(jid, det);
         const lang = langByJid.get(jid) || 'fr';
         const lower = (text || '').toLowerCase();
+        const fromAdmin = isAdminJid(jid);
 
-        if (isAdminJid(jid) && text) {
+        // 1) Admin : seulement les commandes "ok NUM" / "non NUM" sont spéciales
+        if (fromAdmin && text) {
           const decision = parseAdminDecision(text);
           if (decision) {
             let entry = pendingDeposits.get(decision.phone);
@@ -373,7 +345,12 @@ async function startBot() {
             }
             if (!entry) {
               await sock.sendMessage(jid, {
-                text: 'Aucun dépôt en attente pour ' + decision.phone,
+                text:
+                  'Aucun dépôt en attente pour ' +
+                  decision.phone +
+                  '.\nEn attente: ' +
+                  ([...pendingDeposits.keys()].join(', ') || 'aucun') +
+                  '\n\nPour discuter normalement, envoie ta question (pas besoin de commande).',
               });
               continue;
             }
@@ -393,9 +370,12 @@ async function startBot() {
             }
             continue;
           }
+          // Sinon : l'admin continue vers la conversation normale (ci-dessous)
+          console.log('[ADMIN] conversation normale');
         }
 
-        if (text && isDepositClaim(text) && !isAdminJid(jid)) {
+        // 2) Client (pas admin) : affirmation de dépôt
+        if (text && isDepositClaim(text) && !fromAdmin) {
           try {
             await notifyAdminDeposit(jidToPhone(jid), jid);
             await sock.sendMessage(jid, {
@@ -412,24 +392,30 @@ async function startBot() {
           continue;
         }
         if (lower === 'menu' || lower === 'aide' || lower === 'help') {
-          await sock.sendMessage(jid, {
-            text:
-              '*' +
-              BOT_NAME +
-              '*\nhttps://cmr-school.online\nOffres, tarifs, inscription, paiement.\nDépôt fait ? Écrivez: J\'ai effectué un dépôt',
-          });
+          let menu =
+            '*' +
+            BOT_NAME +
+            '*\nhttps://cmr-school.online\nOffres, tarifs, inscription, paiement.\nDépôt fait ? Écrivez: J\'ai effectué un dépôt';
+          if (fromAdmin) {
+            menu +=
+              '\n\n*Admin* — tu peux discuter librement.\nValidation dépôt: ok 2376... ou non 2376...';
+          }
+          await sock.sendMessage(jid, { text: menu });
           continue;
         }
 
         await sock.sendPresenceUpdate('composing', jid).catch(() => {});
 
         if (getMediaType(msg) === 'image') {
-          if (isDepositClaim(text) || /momo|orange|transfert|payment/i.test(text || '')) {
+          if (!fromAdmin && (isDepositClaim(text) || /momo|orange|transfert|payment/i.test(text || ''))) {
             await notifyAdminDeposit(jidToPhone(jid), jid);
             await sock.sendMessage(jid, { text: 'Capture reçue. Vérification en cours.' });
             continue;
           }
-          const reply = await askAI('Image + légende: ' + (text || '') + ' — cadre CMR SCHOOL uniquement.', lang);
+          const reply = await askAI(
+            'Image + légende: ' + (text || '') + ' — cadre CMR SCHOOL uniquement.',
+            lang
+          );
           await sock.sendMessage(jid, { text: reply });
           continue;
         }
