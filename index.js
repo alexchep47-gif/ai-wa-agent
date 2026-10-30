@@ -7,7 +7,6 @@ const {
   makeCacheableSignalKeyStore,
   Browsers,
   downloadMediaMessage,
-  generateMessageIDV2,
 } = require('@whiskeysockets/baileys');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const pino = require('pino');
@@ -27,7 +26,7 @@ const {
   parsePollTimes,
 } = require('./lib/channel-polls');
 const { canPublishToChannel, isAdminSender, parseAdminNumbers } = require('./lib/admin-numbers');
-const { DAILY_INTERACTION_FORMATS, createNativeQuestionMessage, createNativeQuizMessage } = require('./lib/channel-native');
+const { DAILY_INTERACTION_FORMATS, sendNativeChannelInteraction } = require('./lib/channel-native');
 
 const PORT = process.env.PORT || 3000;
 const BOT_NAME = process.env.BOT_NAME || 'CMR SCHOOL';
@@ -35,7 +34,7 @@ const OWNER = (process.env.OWNER_NUMBER || '').replace(/\D/g, '');
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const REPLY_IN_GROUPS = (process.env.REPLY_IN_GROUPS || 'false').toLowerCase() === 'true';
 const ADMIN_NUMBER = (process.env.ADMIN_NUMBER || '237698877771').replace(/\D/g, '');
-const ADMIN_NUMBERS = parseAdminNumbers(process.env.ADMIN_NUMBERS || '237677152300,237698877771');
+const ADMIN_NUMBERS = parseAdminNumbers(process.env.ADMIN_NUMBERS || '237677152300,237698877771,237679126098');
 const ADMIN_JID = ADMIN_NUMBER + '@s.whatsapp.net';
 const CHANNEL_URL = process.env.WHATSAPP_CHANNEL_URL || 'https://whatsapp.com/channel/0029VbC9sfi5q08hsj3JTp0W';
 const CHANNEL_INVITE_CODE = parseChannelInviteCode(CHANNEL_URL);
@@ -491,24 +490,14 @@ async function dispatchChannelPollJob(job) {
     if (job.kind === 'poll') {
       const poll = job.poll;
       const name = `${poll.subject} · ${poll.level} — ${poll.question}`;
-      if (job.format === 'quiz') {
-        await sock.relayMessage(channelJid, createNativeQuizMessage({ name, options: poll.options, answerIndex: poll.answerIndex }), {
-          messageId: generateMessageIDV2(sock.user?.id),
-        });
-      } else if (job.format === 'question') {
-        const openQuestion = `${poll.subject} · ${poll.level} — ${poll.question}`.slice(0, 255);
-        await sock.relayMessage(channelJid, createNativeQuestionMessage(openQuestion), {
-          messageId: generateMessageIDV2(sock.user?.id),
-          additionalAttributes: { type: 'question' },
-        });
-      } else {
-        await sock.sendMessage(channelJid, {
-          poll: { name, values: poll.options, selectableCount: 1 },
-        });
-      }
+      const messageId = await sendNativeChannelInteraction(sock, channelJid, job.format || 'poll', {
+        name: name.slice(0, 255),
+        options: poll.options,
+        answerIndex: poll.answerIndex,
+      });
       publishedQuizAnswers.push({ dateKey: job.dateKey, ...poll });
       publishedQuizAnswers = publishedQuizAnswers.slice(-50);
-      logAdminEvent(`${job.format || 'poll'} natif publié`, ADMIN_JID, `${poll.subject}; ${poll.level}; ${job.id}`);
+      logAdminEvent(`${job.format || 'poll'} natif transmis`, ADMIN_JID, `${poll.subject}; ${poll.level}; ${job.id}; messageId=${messageId}`);
     } else if (job.kind === 'recap') {
       const answers = publishedQuizAnswers.filter((item) => item.dateKey === job.dateKey);
       await sock.sendMessage(channelJid, { text: buildDailyRecap(job.dateKey, answers, POLL_TIMEZONE) });

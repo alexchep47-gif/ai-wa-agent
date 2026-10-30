@@ -4,8 +4,8 @@ const { canPublishToChannel, isAdminSender, parseAdminNumbers } = require('../li
 
 test('normalise et déduplique la liste d’administrateurs', () => {
   assert.deepEqual(
-    parseAdminNumbers(' +237 677 152 300,237698877771,237677152300 '),
-    ['237677152300', '237698877771'],
+    parseAdminNumbers(' +237 677 152 300,237698877771,237679126098,237677152300 '),
+    ['237677152300', '237698877771', '237679126098'],
   );
 });
 
@@ -15,6 +15,7 @@ test('ignore les entrées vides ou invalides', () => {
 
 test('autorise le compte lié de la liste admin si Baileys ne renvoie aucun rôle', () => {
   assert.equal(canPublishToChannel('', '237698877771', ['237677152300', '237698877771']), true);
+  assert.equal(canPublishToChannel('', '237679126098', ['237677152300', '237698877771', '237679126098']), true);
   assert.equal(canPublishToChannel('', '237699000000', ['237677152300', '237698877771']), false);
 });
 
