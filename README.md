@@ -14,6 +14,9 @@ Agent IA WhatsApp **gratuit** — sans préfixe, prompt configurable, déploieme
 | `PORT` | Non | Laissé à Render |
 | `STATUS_RECIPIENTS` | Non | Numéros WhatsApp séparés par des virgules pour l’audience `liste` |
 | `BOT_DATA_DIR` | Non | Dossier des programmations, réglages et journal (défaut : `./data`) |
+| `WHATSAPP_CHANNEL_URL` | Non | Lien d’invitation du canal Mathsfor.all (valeur par défaut : canal fourni) |
+| `POLL_TIMES` | Non | Exactement cinq heures `HH:MM`, séparées par des virgules (défaut : `08:00,11:00,14:00,17:00,20:00`) |
+| `POLL_TIMEZONE` | Non | Fuseau des publications (défaut : `Africa/Douala`) |
 
 Sur **Render**, tu ne crées pas de fichier `.env` : tu ajoutes chaque variable dans **Environment**.
 Si un modèle échoue, l’agent essaie le suivant dans cet ordre. Les modèles partagent le quota Gemini de ta clé/projet : un quota épuisé globalement peut bloquer toute la chaîne.
@@ -29,8 +32,9 @@ Les commandes admin sont accessibles uniquement depuis le numéro `ADMIN_NUMBER`
 - **Mode maintenance** : `!maintenance on` / `!maintenance off`, ou les raccourcis `!pause` et `!resume`. Les dépôts restent signalés à l’admin.
 - **Mémoire courte** : l’agent garde jusqu’à six échanges par conversation pendant la vie du processus. `!reset` efface sa propre mémoire ; l’admin peut faire `!reset NUMERO` pour celle d’un contact.
 - **Intervention humaine et journal** : les demandes de conseiller, réclamations et urgences déclenchent une notification admin, limitée à une par contact toutes les 30 minutes. `!journal` affiche les dix derniers événements.
+- **Sondages du canal Mathsfor.all** : Baileys retrouve l’identifiant interne depuis `WHATSAPP_CHANNEL_URL`; le compte WhatsApp lié doit être administrateur ou propriétaire du canal. Après déploiement et vérification du rôle, l’admin active explicitement l’automatisation avec `!sondages on`. Le bot programme cinq sondages par jour (mathématiques, informatique, chimie, physique, culture scientifique) entre Seconde S et L2, puis publie un corrigé et les liens Instagram, Facebook, TikTok, WhatsApp, YouTube, cmr-school.online et Shop Mathsfor.all 30 minutes après le dernier. `!sondages status`, `!sondages aperçu` et `!sondages off` permettent de contrôler, prévisualiser et arrêter les publications. L’IA Gemini génère les quiz du jour; une banque de questions locale évite de bloquer le calendrier si le quota est épuisé.
 
-L’état opérationnel (contacts connus, réponses rapides, mode maintenance, tâches programmées et journal) est stocké dans `BOT_DATA_DIR`. Sur un hébergement à disque éphémère, il peut être perdu au redéploiement ; configure un volume persistant et règle `BOT_DATA_DIR` sur son point de montage si tu veux conserver ces données. La mémoire de conversation, elle, reste volontairement en RAM et s’efface au redémarrage.
+L’état opérationnel (contacts connus, réponses rapides, mode maintenance, tâches programmées, activation des sondages et journal) est stocké dans `BOT_DATA_DIR`. Sur un hébergement à disque éphémère, il peut être perdu au redéploiement ; configure un volume persistant et règle `BOT_DATA_DIR` sur son point de montage si tu veux conserver ces données. Pour publier à l’heure, le service doit rester actif 24 h/24 : un plan qui met le service en veille ou un redémarrage prolongé peut faire manquer des publications. Le bot abandonne une publication en retard de plus de 15 minutes plutôt que d’inonder le canal au redémarrage. La mémoire de conversation, elle, reste volontairement en RAM et s’efface au redémarrage.
 
 ---
 

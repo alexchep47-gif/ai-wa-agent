@@ -14,6 +14,17 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const { textToPdf } = require('./lib/pdf');
+const {
+  addLocalDays,
+  buildDailyPrompt,
+  buildDailyRecap,
+  fallbackPollBatch,
+  getLocalDateKey,
+  localDateTime,
+  parseChannelInviteCode,
+  parseGeneratedPollBatch,
+  parsePollTimes,
+} = require('./lib/channel-polls');
 
 const PORT = process.env.PORT || 3000;
 const BOT_NAME = process.env.BOT_NAME || 'CMR SCHOOL';
@@ -22,6 +33,20 @@ const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const REPLY_IN_GROUPS = (process.env.REPLY_IN_GROUPS || 'false').toLowerCase() === 'true';
 const ADMIN_NUMBER = (process.env.ADMIN_NUMBER || '237698877771').replace(/\D/g, '');
 const ADMIN_JID = ADMIN_NUMBER + '@s.whatsapp.net';
+const CHANNEL_URL = process.env.WHATSAPP_CHANNEL_URL || 'https://whatsapp.com/channel/0029VbC9sfi5q08hsj3JTp0W';
+const CHANNEL_INVITE_CODE = parseChannelInviteCode(CHANNEL_URL);
+const POLL_TIMES = parsePollTimes(process.env.POLL_TIMES);
+const POLL_TIMEZONE = (() => {
+  const candidate = process.env.POLL_TIMEZONE || 'Africa/Douala';
+  try {
+    new Intl.DateTimeFormat('fr-FR', { timeZone: candidate });
+    return candidate;
+  } catch {
+    console.warn('[POLL] Fuseau invalide, repli sur Africa/Douala :', candidate);
+    return 'Africa/Douala';
+  }
+})();
+const QUIZ_SYSTEM_PROMPT = 'Tu es un professeur et concepteur de quiz rigoureux en mathématiques, informatique, chimie, physique et culture scientifique. Produis uniquement des contenus éducatifs exacts en français et respecte strictement le format JSON demandé.';
 
 const GEMINI_MODELS = [
   process.env.GEMINI_MODEL || 'gemini-2.5-flash',
@@ -95,6 +120,15 @@ let scheduledStatuses = Array.isArray(runtimeState.scheduledStatuses)
 const adminEvents = Array.isArray(runtimeState.adminEvents) ? runtimeState.adminEvents : [];
 let pendingStatus = null;
 const scheduledStatusTimers = new Map();
+let channelPollsEnabled = runtimeState.channelPollsEnabled === true;
+let channelJid = null;
+let channelRole = null;
+let channelCanPost = false;
+let lastChannelResolveAt = 0;
+let scheduledPollJobs = Array.isArray(runtimeState.scheduledPollJobs) ? runtimeState.scheduledPollJobs : [];
+let publishedQuizAnswers = Array.isArray(runtimeState.publishedQuizAnswers) ? runtimeState.publishedQuizAnswers : [];
+const scheduledPollTimers = new Map();
+let pollGenerationPromise = null;
 
 function persistRuntime() {
   runtimeState.statusRecipients = [...statusRecipients];
@@ -102,6 +136,9 @@ function persistRuntime() {
   runtimeState.maintenanceMode = maintenanceMode;
   runtimeState.scheduledStatuses = scheduledStatuses;
   runtimeState.adminEvents = adminEvents.slice(-100);
+  runtimeState.channelPollsEnabled = channelPollsEnabled;
+  runtimeState.scheduledPollJobs = scheduledPollJobs;
+  runtimeState.publishedQuizAnswers = publishedQuizAnswers.slice(-50);
   try {
     saveRuntimeState();
   } catch (e) {
@@ -210,16 +247,16 @@ if (GEMINI_KEY) {
 } else console.log('[WARN] GEMINI_API_KEY absente');
 console.log('[OK] ADMIN dépôts:', ADMIN_NUMBER);
 
-function getModel(name) {
-  return genAI.getGenerativeModel({ model: name, systemInstruction: SYSTEM_PROMPT });
+function getModel(name, systemInstruction = SYSTEM_PROMPT) {
+  return genAI.getGenerativeModel({ model: name, systemInstruction });
 }
 
-async function generateWithFallback(parts, history = []) {
+async function generateWithFallback(parts, history = [], systemInstruction = SYSTEM_PROMPT) {
   if (!genAI) throw new Error('GEMINI_API_KEY manquante');
   let lastErr;
   for (const name of GEMINI_MODELS) {
     try {
-      const model = getModel(name);
+      const model = getModel(name, systemInstruction);
       const result = history.length
         ? await model.startChat({ history }).sendMessage(parts)
         : await model.generateContent(parts);
@@ -377,11 +414,206 @@ function scheduleAllStatuses() {
   for (const job of scheduledStatuses) scheduleStatusJob(job);
 }
 
+async function resolveChannelMetadata() {
+  lastChannelResolveAt = Date.now();
+  if (!sock || !CHANNEL_INVITE_CODE) throw new Error('Lien ou code d’invitation WhatsApp absent.');
+  if (typeof sock.newsletterMetadata !== 'function') {
+    throw new Error('La version de Baileys installée ne prend pas en charge les chaînes WhatsApp.');
+  }
+  const metadata = await sock.newsletterMetadata('invite', CHANNEL_INVITE_CODE);
+  if (!metadata?.id || !metadata.id.endsWith('@newsletter')) {
+    throw new Error('Impossible de récupérer le JID du canal depuis le lien fourni.');
+  }
+  channelJid = metadata.id;
+  channelRole = String(metadata.viewer_metadata?.role || metadata.role || '').toUpperCase();
+  channelCanPost = channelRole === 'ADMIN' || channelRole === 'OWNER';
+  console.log('[CHANNEL] résolu', channelJid, '| rôle =', channelRole || 'inconnu');
+  return metadata;
+}
+
+function channelScheduleLabel() {
+  return `${POLL_TIMES.join(', ')} (${POLL_TIMEZONE})`;
+}
+
+function removePollJob(id) {
+  const timer = scheduledPollTimers.get(id);
+  if (timer) clearTimeout(timer);
+  scheduledPollTimers.delete(id);
+  scheduledPollJobs = scheduledPollJobs.filter((job) => job.id !== id);
+  persistRuntime();
+}
+
+async function dispatchChannelPollJob(job) {
+  scheduledPollTimers.delete(job.id);
+  if (!scheduledPollJobs.some((item) => item.id === job.id)) return;
+  const scheduledAt = Date.parse(job.scheduledAt);
+  const retryAt = Date.parse(job.retryAt || job.scheduledAt);
+  if (Number.isFinite(retryAt) && retryAt > Date.now()) {
+    scheduleChannelPollJob(job);
+    return;
+  }
+  if (!channelPollsEnabled) {
+    removePollJob(job.id);
+    return;
+  }
+  if (!waReady || !sock || !channelJid) {
+    if (Date.now() - scheduledAt > 15 * 60 * 1000) {
+      removePollJob(job.id);
+      await notifyAdmin(`⚠️ Publication manquée pour ${job.id} : WhatsApp/canal indisponible depuis plus de 15 minutes.`);
+      return;
+    }
+    job.retryAt = new Date(Date.now() + 60 * 1000).toISOString();
+    persistRuntime();
+    scheduleChannelPollJob(job);
+    return;
+  }
+  if (!channelCanPost) {
+    removePollJob(job.id);
+    await notifyAdmin(`⚠️ ${job.id} non publié : le compte WhatsApp lié n’est pas administrateur/propriétaire du canal.`);
+    return;
+  }
+  if (Date.now() - scheduledAt > 15 * 60 * 1000) {
+    removePollJob(job.id);
+    await notifyAdmin(`⚠️ Publication ${job.id} ignorée : retard supérieur à 15 minutes, pour éviter un envoi groupé tardif.`);
+    return;
+  }
+
+  try {
+    if (job.kind === 'poll') {
+      const poll = job.poll;
+      const name = `${poll.subject} · ${poll.level} — ${poll.question}`;
+      await sock.sendMessage(channelJid, {
+        poll: { name, values: poll.options, selectableCount: 1 },
+      });
+      publishedQuizAnswers.push({ dateKey: job.dateKey, ...poll });
+      publishedQuizAnswers = publishedQuizAnswers.slice(-50);
+      logAdminEvent('sondage publié', ADMIN_JID, `${poll.subject}; ${poll.level}; ${job.id}`);
+    } else if (job.kind === 'recap') {
+      const answers = publishedQuizAnswers.filter((item) => item.dateKey === job.dateKey);
+      await sock.sendMessage(channelJid, { text: buildDailyRecap(job.dateKey, answers, POLL_TIMEZONE) });
+      publishedQuizAnswers = publishedQuizAnswers.filter((item) => item.dateKey !== job.dateKey);
+      logAdminEvent('corrigé et promotion publiés', ADMIN_JID, job.dateKey);
+    }
+    removePollJob(job.id);
+  } catch (e) {
+    removePollJob(job.id);
+    logAdminEvent('échec publication canal', ADMIN_JID, `${job.id}: ${e?.message || e}`);
+    await notifyAdmin(`❌ Publication du canal échouée (${job.id}) : ${e?.message || e}`);
+  }
+}
+
+function scheduleChannelPollJob(job) {
+  if (scheduledPollTimers.has(job.id)) return;
+  const delay = Math.max(0, Date.parse(job.retryAt || job.scheduledAt) - Date.now());
+  const timer = setTimeout(() => dispatchChannelPollJob(job), Math.min(delay, 2147480000));
+  timer.unref?.();
+  scheduledPollTimers.set(job.id, timer);
+}
+
+function scheduleAllChannelPolls() {
+  for (const job of scheduledPollJobs) scheduleChannelPollJob(job);
+}
+
+function formatPollPreview() {
+  const polls = scheduledPollJobs.filter((job) => job.kind === 'poll');
+  if (!polls.length) return 'Aucun sondage en file. Active le programme avec !sondages on.';
+  return `Aperçu des sondages programmés :\n${polls.map((job) => {
+    const poll = job.poll;
+    return `\n${new Date(job.scheduledAt).toLocaleString('fr-FR', { timeZone: POLL_TIMEZONE })} · ${poll.subject} (${poll.level})\n${poll.question}\n${poll.options.map((option, index) => `${index + 1}. ${option}`).join('\n')}\nRéponse : ${poll.options[poll.answerIndex]}\n${poll.explanation}`;
+  }).join('\n')}`;
+}
+
+async function ensureDailyPollJobs() {
+  if (!channelPollsEnabled || !waReady || !sock || !channelJid || !channelCanPost) return;
+  if (pollGenerationPromise) return pollGenerationPromise;
+  const today = getLocalDateKey(new Date(), POLL_TIMEZONE);
+  const futureSlots = POLL_TIMES.filter((time) => localDateTime(today, time, POLL_TIMEZONE).getTime() > Date.now() + 2 * 60 * 1000);
+  const targetDate = futureSlots.length === POLL_TIMES.length ? today : addLocalDays(today, 1);
+  if (runtimeState.pollsGeneratedDate === targetDate) {
+    scheduleAllChannelPolls();
+    return;
+  }
+  pollGenerationPromise = (async () => {
+    let polls;
+    try {
+      const raw = await generateWithFallback(buildDailyPrompt(targetDate), [], QUIZ_SYSTEM_PROMPT);
+      polls = parseGeneratedPollBatch(raw);
+      console.log('[POLL] Quiz quotidiens générés par Gemini pour', targetDate);
+    } catch (e) {
+      polls = fallbackPollBatch(targetDate);
+      console.warn('[POLL] Génération IA indisponible; banque locale utilisée:', e?.message || e);
+      logAdminEvent('banque de secours quiz utilisée', ADMIN_JID, `${targetDate}: ${e?.message || e}`);
+    }
+    scheduledPollJobs = scheduledPollJobs.filter((job) => job.dateKey >= targetDate);
+    const newJobs = polls.map((poll, index) => ({
+      id: `quiz-${targetDate}-${index + 1}`,
+      kind: 'poll',
+      dateKey: targetDate,
+      poll,
+      scheduledAt: localDateTime(targetDate, POLL_TIMES[index], POLL_TIMEZONE).toISOString(),
+    }));
+    const [lastHour, lastMinute] = POLL_TIMES[POLL_TIMES.length - 1].split(':').map(Number);
+    const recapTotal = lastHour * 60 + lastMinute + 30;
+    const recapDate = recapTotal >= 1440 ? addLocalDays(targetDate, 1) : targetDate;
+    const recapTime = `${String(Math.floor(recapTotal % 1440 / 60)).padStart(2, '0')}:${String(recapTotal % 60).padStart(2, '0')}`;
+    newJobs.push({
+      id: `quiz-recap-${targetDate}`,
+      kind: 'recap',
+      dateKey: targetDate,
+      scheduledAt: localDateTime(recapDate, recapTime, POLL_TIMEZONE).toISOString(),
+    });
+    scheduledPollJobs.push(...newJobs);
+    runtimeState.pollsGeneratedDate = targetDate;
+    persistRuntime();
+    scheduleAllChannelPolls();
+  })().finally(() => {
+    pollGenerationPromise = null;
+  });
+  return pollGenerationPromise;
+}
+
 async function handleControlCommand(msg, jid, text, fromAdmin) {
   const lower = (text || '').trim().toLowerCase();
-  const adminOnly = /^(?:!|\/)(?:statut|status|confirmer statut|annuler statut|statuts|annulerstatut|maintenance|pause|resume|reponse|reponses|journal)(?:\s|$|:)/i.test(text || '');
+  const adminOnly = /^(?:!|\/)(?:statut|status|confirmer statut|annuler statut|statuts|annulerstatut|maintenance|pause|resume|reponse|reponses|journal|sondages)(?:\s|$|:)/i.test(text || '');
   if (adminOnly && !fromAdmin) {
     await sock.sendMessage(jid, { text: 'Cette commande est réservée à l’administrateur.' });
+    return true;
+  }
+
+  const pollCommand = text.trim().match(/^(?:!|\/)sondages(?:\s+(on|off|status|statut|aperçu|apercu))?\s*$/i);
+  if (fromAdmin && pollCommand) {
+    const action = (pollCommand[1] || 'status').toLowerCase();
+    if (action === 'on') {
+      try {
+        if (!channelJid) await resolveChannelMetadata();
+      } catch (e) {
+        await sock.sendMessage(jid, { text: `Impossible d’activer les sondages : ${e?.message || e}` });
+        return true;
+      }
+      if (!channelCanPost) {
+        await sock.sendMessage(jid, { text: `Activation refusée : le compte lié doit être administrateur ou propriétaire du canal. Rôle détecté : ${channelRole || 'inconnu'}.` });
+        return true;
+      }
+      channelPollsEnabled = true;
+      persistRuntime();
+      logAdminEvent('sondages automatiques activés', jid, `${channelJid}; ${channelScheduleLabel()}`);
+      await sock.sendMessage(jid, { text: `✅ Programme activé pour ${channelJid}. Cinq sondages par jour aux horaires ${channelScheduleLabel()}, puis un corrigé avec les liens Mathsfor.all 30 minutes après le dernier. Commandes : !sondages aperçu, !sondages off.` });
+      ensureDailyPollJobs().catch((e) => notifyAdmin(`❌ Préparation des sondages impossible : ${e?.message || e}`));
+    } else if (action === 'off') {
+      channelPollsEnabled = false;
+      for (const timer of scheduledPollTimers.values()) clearTimeout(timer);
+      scheduledPollTimers.clear();
+      scheduledPollJobs = [];
+      runtimeState.pollsGeneratedDate = null;
+      persistRuntime();
+      logAdminEvent('sondages automatiques désactivés', jid, channelJid || 'canal non résolu');
+      await sock.sendMessage(jid, { text: 'Programme de sondages désactivé ; toutes les publications futures en file ont été annulées.' });
+    } else if (action === 'aperçu' || action === 'apercu') {
+      await sock.sendMessage(jid, { text: formatPollPreview() });
+    } else {
+      const count = scheduledPollJobs.filter((job) => job.kind === 'poll').length;
+      await sock.sendMessage(jid, { text: `Sondages automatiques : ${channelPollsEnabled ? 'ACTIFS' : 'inactifs'}\nCanal : ${channelJid || CHANNEL_URL}\nRôle du compte : ${channelRole || 'non vérifié'}\nHoraires : ${channelScheduleLabel()}\nQuiz en attente : ${count}\n${channelPollsEnabled ? 'Désactiver : !sondages off' : 'Activer : !sondages on'}` });
+    }
     return true;
   }
 
@@ -712,6 +944,15 @@ async function startBot() {
     } else if (connection === 'open') {
       waReady = true;
       console.log('\n[OK] CONNECTÉ À WHATSAPP | store= local\n');
+      resolveChannelMetadata()
+        .then((metadata) => {
+          if (!channelCanPost) {
+            notifyAdmin(`ℹ️ Canal détecté (${metadata.name || channelJid}), mais le compte lié a le rôle ${channelRole || 'inconnu'}. Ajoute-le comme administrateur pour publier les sondages.`);
+            return;
+          }
+          if (channelPollsEnabled) return ensureDailyPollJobs();
+        })
+        .catch((e) => notifyAdmin(`⚠️ Le canal WhatsApp n’a pas pu être résolu : ${e?.message || e}`));
     }
   });
 
@@ -852,6 +1093,18 @@ async function startBot() {
 }
 
 scheduleAllStatuses();
+const pollHeartbeat = setInterval(() => {
+  if (channelPollsEnabled && waReady) {
+    if (!channelJid && Date.now() - lastChannelResolveAt >= 5 * 60 * 1000) {
+      resolveChannelMetadata()
+        .then(() => ensureDailyPollJobs())
+        .catch((e) => console.error('[POLL] résolution canal', e?.message || e));
+    } else {
+      ensureDailyPollJobs().catch((e) => console.error('[POLL] scheduler', e?.message || e));
+    }
+  }
+}, 60 * 1000);
+pollHeartbeat.unref?.();
 startBot().catch((e) => {
   console.error('[ERR] start', e);
   scheduleReconnect(5000, 'start');
