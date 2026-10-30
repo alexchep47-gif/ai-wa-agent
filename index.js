@@ -14,6 +14,7 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const { textToPdf } = require('./lib/pdf');
+const { useMongoAuthState } = require('./lib/mongoAuth');
 
 const PORT = process.env.PORT || 3000;
 const BOT_NAME = process.env.BOT_NAME || 'CMR SCHOOL';
@@ -22,6 +23,7 @@ const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const REPLY_IN_GROUPS = (process.env.REPLY_IN_GROUPS || 'false').toLowerCase() === 'true';
 const ADMIN_NUMBER = (process.env.ADMIN_NUMBER || '237698877771').replace(/\D/g, '');
 const ADMIN_JID = ADMIN_NUMBER + '@s.whatsapp.net';
+const MONGODB_URI = process.env.MONGODB_URI || '';
 
 const GEMINI_MODELS = [
   process.env.GEMINI_MODEL,
@@ -34,7 +36,6 @@ const GEMINI_MODELS = [
 const DEFAULT_SYSTEM_PROMPT = `Tu es l'agent officiel de CMR SCHOOL (https://cmr-school.online).
 Tu réponds uniquement à propos de CMR SCHOOL, ses offres, tarifs, inscription, paiement et fonctionnement.
 Style : français ou anglais selon le message, court, clair, adapté à WhatsApp.
-
 Site : https://cmr-school.online
 Offres : CMR Fiches, CMR Répétitions (~20k/30k/40k FCFA selon classe), CMR Pack.
 Contact : WhatsApp +237 677 152 300. PayPal ou Mobile Money.
@@ -74,7 +75,6 @@ function isDepositClaim(text) {
     /j'?ai envoy/i,
     /j'?ai effectu/i,
     /paiement effectu/i,
-    /souscription pay/i,
     /momo/i,
     /orange money/i,
     /i paid/i,
@@ -82,11 +82,6 @@ function isDepositClaim(text) {
   ].some((re) => re.test(t));
 }
 
-/**
- * Validation admin UNIQUEMENT si le message contient
- * explicitement : ok/non + numéro client
- * (ex: "ok 2376xxxxxxxx"). Ainsi l'admin peut discuter librement.
- */
 function parseAdminDecision(text) {
   const t = (text || '').trim();
   const m = t.match(/^(ok|oui|valider?|confirm(?:e|er)?|yes)\s+(\d{8,15})\s*$/i);
@@ -105,8 +100,7 @@ function jidToPhone(jid) {
 }
 
 function isAdminJid(jid) {
-  const p = jidToPhone(jid);
-  return p === ADMIN_NUMBER || jid === ADMIN_JID;
+  return jidToPhone(jid) === ADMIN_NUMBER || jid === ADMIN_JID;
 }
 
 let genAI = null;
@@ -116,7 +110,9 @@ if (GEMINI_KEY) {
   activeModelName = GEMINI_MODELS[0];
   console.log('[OK] Gemini —', GEMINI_MODELS.join(' → '));
 } else console.log('[WARN] GEMINI_API_KEY absente');
-console.log('[OK] ADMIN dépôts (peut aussi discuter):', ADMIN_NUMBER);
+console.log('[OK] ADMIN dépôts:', ADMIN_NUMBER);
+if (MONGODB_URI) console.log('[OK] MONGODB_URI défini → session persistante');
+else console.log('[WARN] Pas de MONGODB_URI → session perdue à chaque deploy Render');
 
 function getModel(name) {
   return genAI.getGenerativeModel({ model: name, systemInstruction: SYSTEM_PROMPT });
@@ -214,11 +210,23 @@ async function notifyAdminDeposit(clientPhone, clientJid) {
     displayPhone +
     '\nPour refuser : non ' +
     displayPhone +
-    '\n\n(Tu peux aussi m\'\u00e9crire normalement pour toute autre question CMR SCHOOL.)';
+    "\n\n(Tu peux aussi m'écrire normalement pour toute autre question CMR SCHOOL.)";
   const key = String(clientPhone).replace(/\D/g, '') || clientPhone;
   pendingDeposits.set(key, { jid: clientJid, at: Date.now() });
   await sock.sendMessage(ADMIN_JID, { text: adminMsg });
   console.log('[DEPOT] Alerte →', ADMIN_NUMBER, '| client', displayPhone);
+}
+
+async function loadAuthState() {
+  if (MONGODB_URI) {
+    try {
+      return await useMongoAuthState(MONGODB_URI);
+    } catch (e) {
+      console.error('[AUTH] Mongo échoué:', e.message, '— fallback fichiers locaux');
+    }
+  }
+  const local = await useMultiFileAuthState(AUTH_DIR);
+  return { state: local.state, saveCreds: local.saveCreds };
 }
 
 const app = express();
@@ -228,19 +236,24 @@ app.get('/', (req, res) => {
       BOT_NAME +
       '</h2><p>WhatsApp: <b>' +
       (waReady ? 'CONNECTÉ' : 'hors ligne') +
-      '</b></p><p>Admin: ' +
-      ADMIN_NUMBER +
-      '</p>'
+      '</b></p><p>Session: <b>' +
+      (MONGODB_URI ? 'MongoDB (persistante)' : 'locale (volatile)') +
+      '</b></p>'
   );
 });
 app.get('/health', (req, res) =>
-  res.json({ status: 'ok', whatsapp: waReady, admin: ADMIN_NUMBER, pending: pendingDeposits.size })
+  res.json({
+    status: 'ok',
+    whatsapp: waReady,
+    session: MONGODB_URI ? 'mongodb' : 'local',
+    admin: ADMIN_NUMBER,
+  })
 );
 app.listen(PORT, () => console.log('[OK] HTTP port', PORT));
 
 async function startBot() {
   const myBoot = ++bootId;
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  const { state, saveCreds } = await loadAuthState();
   const { version } = await fetchLatestBaileysVersion();
   const registered = !!state.creds?.registered;
 
@@ -248,6 +261,7 @@ async function startBot() {
   console.log('[BOOT]', myBoot, '| Baileys', version.join('.'));
   console.log('[BOOT] OWNER_NUMBER =', OWNER || '(VIDE)');
   console.log('[BOOT] registered =', registered);
+  console.log('[BOOT] session store =', MONGODB_URI ? 'MongoDB' : 'fichiers locaux');
   console.log('----------------------------------------');
 
   sock = makeWASocket({
@@ -299,13 +313,14 @@ async function startBot() {
       }
       if (status === DisconnectReason.loggedOut || status === 401 || status === 440) {
         pairingRequested = false;
+        console.log('[CONN] Session invalidée — il faudra re-pairer une fois');
         return;
       }
       pairingRequested = false;
       scheduleReconnect(5000, 'close');
     } else if (connection === 'open') {
       waReady = true;
-      console.log('\n[OK] CONNECTÉ À WHATSAPP | admin=', ADMIN_NUMBER, '\n');
+      console.log('\n[OK] CONNECTÉ À WHATSAPP | store=', MONGODB_URI ? 'MongoDB' : 'local', '\n');
     }
   });
 
@@ -328,7 +343,6 @@ async function startBot() {
         const lower = (text || '').toLowerCase();
         const fromAdmin = isAdminJid(jid);
 
-        // 1) Admin : seulement les commandes "ok NUM" / "non NUM" sont spéciales
         if (fromAdmin && text) {
           const decision = parseAdminDecision(text);
           if (decision) {
@@ -345,12 +359,7 @@ async function startBot() {
             }
             if (!entry) {
               await sock.sendMessage(jid, {
-                text:
-                  'Aucun dépôt en attente pour ' +
-                  decision.phone +
-                  '.\nEn attente: ' +
-                  ([...pendingDeposits.keys()].join(', ') || 'aucun') +
-                  '\n\nPour discuter normalement, envoie ta question (pas besoin de commande).',
+                text: 'Aucun dépôt en attente pour ' + decision.phone,
               });
               continue;
             }
@@ -370,11 +379,8 @@ async function startBot() {
             }
             continue;
           }
-          // Sinon : l'admin continue vers la conversation normale (ci-dessous)
-          console.log('[ADMIN] conversation normale');
         }
 
-        // 2) Client (pas admin) : affirmation de dépôt
         if (text && isDepositClaim(text) && !fromAdmin) {
           try {
             await notifyAdminDeposit(jidToPhone(jid), jid);
@@ -392,15 +398,12 @@ async function startBot() {
           continue;
         }
         if (lower === 'menu' || lower === 'aide' || lower === 'help') {
-          let menu =
-            '*' +
-            BOT_NAME +
-            '*\nhttps://cmr-school.online\nOffres, tarifs, inscription, paiement.\nDépôt fait ? Écrivez: J\'ai effectué un dépôt';
-          if (fromAdmin) {
-            menu +=
-              '\n\n*Admin* — tu peux discuter librement.\nValidation dépôt: ok 2376... ou non 2376...';
-          }
-          await sock.sendMessage(jid, { text: menu });
+          await sock.sendMessage(jid, {
+            text:
+              '*' +
+              BOT_NAME +
+              '*\nhttps://cmr-school.online\nOffres, tarifs, inscription, paiement.\nDépôt fait ? Écrivez: J\'ai effectué un dépôt',
+          });
           continue;
         }
 
