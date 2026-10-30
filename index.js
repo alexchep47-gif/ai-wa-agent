@@ -55,6 +55,21 @@ function storeMsg(msg) {
 
 const langByJid = new Map();
 const pendingDeposits = new Map();
+const statusRecipients = new Set();
+
+function rememberStatusContact(contact) {
+  const candidates = [contact?.id, contact?.phoneNumber];
+  for (const jid of candidates) {
+    if (typeof jid === 'string' && /^\d+@s\.whatsapp\.net$/.test(jid)) {
+      statusRecipients.add(jid);
+    }
+  }
+}
+
+function parseStatusCommand(text) {
+  const match = (text || '').trim().match(/^(?:!|\/)?(?:statut|status)(?:\s*[:\-]\s*|\s+)([\s\S]+)$/i);
+  return match ? match[1].trim() : null;
+}
 
 function detectLang(text) {
   const t = (text || '').toLowerCase();
@@ -316,6 +331,7 @@ async function startBot() {
         storeMsg(msg);
         if (!msg.message || msg.key.fromMe) continue;
         const jid = msg.key.remoteJid;
+        if (jid && jid.endsWith('@s.whatsapp.net')) rememberStatusContact({ id: jid });
         if (isBroadcast(jid)) continue;
         if (isGroupJid(jid) && !REPLY_IN_GROUPS) continue;
 
@@ -328,6 +344,42 @@ async function startBot() {
         const lang = langByJid.get(jid) || 'fr';
         const lower = (text || '').toLowerCase();
         const fromAdmin = isAdminJid(jid);
+
+        if (/^(?:(?:!|\/)(?:statut|status)(?:\s|[:\-]|$)|(?:statut|status)(?:\s*[:\-]\s*|$))/i.test(text)) {
+          if (!fromAdmin) {
+            await sock.sendMessage(jid, { text: 'Cette commande est réservée à l’administrateur.' });
+            continue;
+          }
+          const statusText = parseStatusCommand(text);
+          if (!statusText) {
+            await sock.sendMessage(jid, { text: 'Usage : statut: Ton texte ici' });
+            continue;
+          }
+          if (statusText.length > 700) {
+            await sock.sendMessage(jid, { text: 'Le statut texte ne peut pas dépasser 700 caractères.' });
+            continue;
+          }
+          if (statusRecipients.size === 0) {
+            await sock.sendMessage(jid, {
+              text: 'Je ne connais encore aucun contact destinataire. Les contacts doivent être synchronisés ou m’avoir déjà écrit.',
+            });
+            continue;
+          }
+          try {
+            await sock.sendMessage(
+              'status@broadcast',
+              { text: statusText },
+              { broadcast: true, statusJidList: [...statusRecipients] }
+            );
+            await sock.sendMessage(jid, {
+              text: `✅ Statut publié pour ${statusRecipients.size} contact(s).`,
+            });
+          } catch (e) {
+            console.error('[STATUS] Publication échouée:', e?.message || e);
+            await sock.sendMessage(jid, { text: '❌ Échec de publication du statut. Vérifie les logs Render.' });
+          }
+          continue;
+        }
 
         if (fromAdmin && text) {
           const decision = parseAdminDecision(text);

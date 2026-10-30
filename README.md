@@ -16,6 +16,10 @@ Agent IA WhatsApp **gratuit** — sans préfixe, prompt configurable, déploieme
 Sur **Render**, tu ne crées pas de fichier `.env` : tu ajoutes chaque variable dans **Environment**.
 Si un modèle échoue, l’agent essaie le suivant dans cet ordre. Les modèles partagent le quota Gemini de ta clé/projet : un quota épuisé globalement peut bloquer toute la chaîne.
 
+## Statut WhatsApp (administrateur)
+
+Depuis le numéro configuré dans `ADMIN_NUMBER`, envoie au bot `statut: Ton texte ici` (ou `!statut Ton texte ici`) pour publier un statut texte. La commande est réservée à l’administrateur et limitée à 700 caractères. L’audience comprend les contacts WhatsApp qui ont déjà écrit au bot depuis son dernier démarrage ; elle n’est pas automatiquement élargie aux contacts inconnus. Baileys requiert une liste de JID destinataires pour publier un statut.
+
 ---
 
 ## Déploiement Render + connexion WhatsApp (iPhone)
