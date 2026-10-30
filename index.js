@@ -44,6 +44,31 @@ const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT;
 const logger = pino({ level: 'silent' });
 const AUTH_DIR = path.join(__dirname, 'auth_info');
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+const DATA_DIR = process.env.BOT_DATA_DIR || path.join(__dirname, 'data');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+const STATE_FILE = path.join(DATA_DIR, 'bot_state.json');
+const DEFAULT_QUICK_REPLIES = {
+  tarifs: 'Consulte nos offres et tarifs sur https://cmr-school.online. Écris « inscription » pour commencer.',
+  inscription: 'Pour t’inscrire, visite https://cmr-school.online ou écris au +237 677 152 300.',
+  contact: 'Contact CMR SCHOOL : WhatsApp +237 677 152 300 — https://cmr-school.online',
+};
+
+function loadRuntimeState() {
+  try {
+    const value = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    return value && typeof value === 'object' ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+const runtimeState = loadRuntimeState();
+function saveRuntimeState() {
+  const tmp = STATE_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(runtimeState, null, 2), { mode: 0o600 });
+  fs.chmodSync(tmp, 0o600);
+  fs.renameSync(tmp, STATE_FILE);
+}
 
 const msgStore = new Map();
 function storeMsg(msg) {
@@ -55,20 +80,80 @@ function storeMsg(msg) {
 
 const langByJid = new Map();
 const pendingDeposits = new Map();
-const statusRecipients = new Set();
+const conversationHistory = new Map();
+const escalationThrottle = new Map();
+const statusRecipients = new Set(
+  Array.isArray(runtimeState.statusRecipients)
+    ? runtimeState.statusRecipients.filter((jid) => typeof jid === 'string' && /^\d+@s\.whatsapp\.net$/.test(jid))
+    : []
+);
+const quickReplies = { ...DEFAULT_QUICK_REPLIES, ...(runtimeState.quickReplies || {}) };
+let maintenanceMode = !!runtimeState.maintenanceMode;
+let scheduledStatuses = Array.isArray(runtimeState.scheduledStatuses)
+  ? runtimeState.scheduledStatuses
+  : [];
+const adminEvents = Array.isArray(runtimeState.adminEvents) ? runtimeState.adminEvents : [];
+let pendingStatus = null;
+const scheduledStatusTimers = new Map();
+
+function persistRuntime() {
+  runtimeState.statusRecipients = [...statusRecipients];
+  runtimeState.quickReplies = quickReplies;
+  runtimeState.maintenanceMode = maintenanceMode;
+  runtimeState.scheduledStatuses = scheduledStatuses;
+  runtimeState.adminEvents = adminEvents.slice(-100);
+  try {
+    saveRuntimeState();
+  } catch (e) {
+    console.error('[STATE] Sauvegarde impossible:', e?.message || e);
+  }
+}
 
 function rememberStatusContact(contact) {
   const candidates = [contact?.id, contact?.phoneNumber];
   for (const jid of candidates) {
     if (typeof jid === 'string' && /^\d+@s\.whatsapp\.net$/.test(jid)) {
       statusRecipients.add(jid);
+      persistRuntime();
     }
   }
 }
 
 function parseStatusCommand(text) {
-  const match = (text || '').trim().match(/^(?:!|\/)?(?:statut|status)(?:\s*[:\-]\s*|\s+)([\s\S]+)$/i);
-  return match ? match[1].trim() : null;
+  const body = (text || '').trim().replace(/^(?:!|\/)?(?:statut|status)\s*/i, '');
+  const scheduled = body.match(/^dans\s+(\d+)\s*(m|min|minutes?|h|heures?)\s*:\s*([\s\S]+)$/i);
+  if (scheduled) {
+    const count = Number(scheduled[1]);
+    const unit = scheduled[2].toLowerCase();
+    const minutes = unit.startsWith('h') ? count * 60 : count;
+    if (minutes < 1 || minutes > 10080) return null;
+    return {
+      caption: scheduled[3].trim(),
+      audience: 'known',
+      scheduledAt: new Date(Date.now() + minutes * 60000).toISOString(),
+    };
+  }
+  const audience = body.match(/^(connus|liste)\s*:\s*([\s\S]+)$/i);
+  const textMatch = body.match(/^:\s*([\s\S]+)$/);
+  const caption = (audience ? audience[2] : textMatch ? textMatch[1] : body.replace(/^[-:]\s*/, '')).trim();
+  if (!caption) return null;
+  return { caption, audience: audience?.[1]?.toLowerCase() === 'liste' ? 'list' : 'known' };
+}
+
+function recipientsForAudience(audience) {
+  if (audience === 'list') {
+    return [...new Set((process.env.STATUS_RECIPIENTS || '')
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .map((entry) => (entry.includes('@') ? entry : entry.replace(/\D/g, '') + '@s.whatsapp.net'))
+      .filter((jid) => /^\d+@s\.whatsapp\.net$/.test(jid)))];
+  }
+  return [...statusRecipients];
+}
+
+function formatStatusDate(date) {
+  return new Date(date).toLocaleString('fr-FR', { timeZone: 'Africa/Douala' });
 }
 
 function detectLang(text) {
@@ -129,12 +214,15 @@ function getModel(name) {
   return genAI.getGenerativeModel({ model: name, systemInstruction: SYSTEM_PROMPT });
 }
 
-async function generateWithFallback(parts) {
+async function generateWithFallback(parts, history = []) {
   if (!genAI) throw new Error('GEMINI_API_KEY manquante');
   let lastErr;
   for (const name of GEMINI_MODELS) {
     try {
-      const result = await getModel(name).generateContent(parts);
+      const model = getModel(name);
+      const result = history.length
+        ? await model.startChat({ history }).sendMessage(parts)
+        : await model.generateContent(parts);
       if (activeModelName !== name) {
         activeModelName = name;
         console.log('[OK] Modèle actif:', name);
@@ -148,14 +236,25 @@ async function generateWithFallback(parts) {
   throw lastErr || new Error('Gemini échoué');
 }
 
-async function askAI(userMessage, lang) {
+async function askAI(userMessage, lang, jid) {
   if (!genAI) return 'Ajoute GEMINI_API_KEY sur Render.';
   const prefix =
     lang === 'en'
       ? 'English, short, CMR SCHOOL only.\n\n'
       : 'Français, court, uniquement CMR SCHOOL.\n\n';
+  const prompt = prefix + userMessage;
+  const history = jid ? conversationHistory.get(jid) || [] : [];
   try {
-    return await generateWithFallback(prefix + userMessage);
+    const reply = await generateWithFallback(prompt, history);
+    if (jid) {
+      const next = [
+        ...history,
+        { role: 'user', parts: [{ text: prompt }] },
+        { role: 'model', parts: [{ text: reply }] },
+      ].slice(-12);
+      conversationHistory.set(jid, next);
+    }
+    return reply;
   } catch (e) {
     return 'Erreur IA: ' + String(e.message).slice(0, 160);
   }
@@ -171,6 +270,7 @@ function extractText(msg) {
     m.conversation ||
     m.extendedTextMessage?.text ||
     m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
     m.documentMessage?.caption ||
     m.documentWithCaptionMessage?.message?.documentMessage?.caption ||
     ''
@@ -181,6 +281,7 @@ function getMediaType(msg) {
   const m = msg.message;
   if (!m) return null;
   if (m.imageMessage) return 'image';
+  if (m.videoMessage) return 'video';
   if (m.documentMessage || m.documentWithCaptionMessage?.message?.documentMessage) return 'document';
   return null;
 }
@@ -201,6 +302,286 @@ let pairingRequested = false;
 let lastIncomingJid = null;
 let reconnectTimer = null;
 let bootId = 0;
+
+function logAdminEvent(type, jid, detail) {
+  adminEvents.push({
+    at: new Date().toISOString(),
+    type,
+    phone: jidToPhone(jid),
+    detail: String(detail || '').slice(0, 240),
+  });
+  if (adminEvents.length > 100) adminEvents.splice(0, adminEvents.length - 100);
+  persistRuntime();
+}
+
+async function notifyAdmin(text) {
+  try {
+    await sock.sendMessage(ADMIN_JID, { text });
+  } catch (e) {
+    console.error('[ADMIN] Notification impossible:', e?.message || e);
+  }
+}
+
+async function publishStatus(draft) {
+  if (!sock || !waReady) throw new Error('WhatsApp non connecté');
+  const recipients = draft.recipients || recipientsForAudience(draft.audience);
+  if (!recipients.length) throw new Error('Audience vide');
+  let content;
+  if (draft.mediaType === 'image' || draft.mediaType === 'video') {
+    content = {
+      [draft.mediaType]: Buffer.from(draft.mediaBase64, 'base64'),
+      ...(draft.caption ? { caption: draft.caption } : {}),
+    };
+  } else {
+    content = { text: draft.caption };
+  }
+  await sock.sendMessage('status@broadcast', content, {
+    broadcast: true,
+    statusJidList: recipients,
+  });
+  return recipients.length;
+}
+
+async function dispatchScheduledStatus(job) {
+  scheduledStatusTimers.delete(job.id);
+  if (Date.parse(job.scheduledAt) > Date.now()) {
+    scheduleStatusJob(job);
+    return;
+  }
+  if (!waReady || !sock) {
+    job.scheduledAt = new Date(Date.now() + 60000).toISOString();
+    persistRuntime();
+    scheduleStatusJob(job);
+    return;
+  }
+  try {
+    const count = await publishStatus(job);
+    logAdminEvent('statut programmé publié', ADMIN_JID, `${job.id}; ${count} destinataires`);
+    await notifyAdmin(`✅ Statut programmé ${job.id} publié (${count} destinataires).`);
+  } catch (e) {
+    logAdminEvent('échec statut programmé', ADMIN_JID, `${job.id}: ${e?.message || e}`);
+    await notifyAdmin(`❌ Statut programmé ${job.id} non publié : ${e?.message || e}`);
+  }
+  scheduledStatuses = scheduledStatuses.filter((item) => item.id !== job.id);
+  persistRuntime();
+}
+
+function scheduleStatusJob(job) {
+  if (scheduledStatusTimers.has(job.id)) return;
+  const delay = Math.max(0, Date.parse(job.scheduledAt) - Date.now());
+  const timer = setTimeout(() => dispatchScheduledStatus(job), Math.min(delay, 2147480000));
+  scheduledStatusTimers.set(job.id, timer);
+}
+
+function scheduleAllStatuses() {
+  for (const job of scheduledStatuses) scheduleStatusJob(job);
+}
+
+async function handleControlCommand(msg, jid, text, fromAdmin) {
+  const lower = (text || '').trim().toLowerCase();
+  const adminOnly = /^(?:!|\/)(?:statut|status|confirmer statut|annuler statut|statuts|annulerstatut|maintenance|pause|resume|reponse|reponses|journal)(?:\s|$|:)/i.test(text || '');
+  if (adminOnly && !fromAdmin) {
+    await sock.sendMessage(jid, { text: 'Cette commande est réservée à l’administrateur.' });
+    return true;
+  }
+
+  if (fromAdmin && /^(?:!|\/)maintenance(?:\s|$)/i.test(text)) {
+    const mode = lower.split(/\s+/)[1];
+    if (mode === 'on' || mode === 'off') {
+      maintenanceMode = mode === 'on';
+      persistRuntime();
+      logAdminEvent('maintenance', jid, maintenanceMode ? 'activée' : 'désactivée');
+      await sock.sendMessage(jid, { text: `Mode maintenance ${maintenanceMode ? 'activé' : 'désactivé'}.` });
+    } else {
+      await sock.sendMessage(jid, { text: `Maintenance : ${maintenanceMode ? 'active' : 'inactive'}. Utilise !maintenance on|off.` });
+    }
+    return true;
+  }
+  if (fromAdmin && /^(?:!|\/)pause$/i.test(text)) {
+    maintenanceMode = true;
+    persistRuntime();
+    logAdminEvent('maintenance', jid, 'activée');
+    await sock.sendMessage(jid, { text: 'Réponses automatiques suspendues. Utilise !resume pour reprendre.' });
+    return true;
+  }
+  if (fromAdmin && /^(?:!|\/)resume$/i.test(text)) {
+    maintenanceMode = false;
+    persistRuntime();
+    logAdminEvent('maintenance', jid, 'désactivée');
+    await sock.sendMessage(jid, { text: 'Réponses automatiques réactivées.' });
+    return true;
+  }
+  if (fromAdmin && /^(?:!|\/)reponses$/i.test(text)) {
+    const keys = Object.keys(quickReplies);
+    await sock.sendMessage(jid, { text: `Réponses rapides : ${keys.map((key) => `!${key}`).join(', ')}\nModifier : !reponse clé | texte` });
+    return true;
+  }
+  if (fromAdmin && /^(?:!|\/)reponse\s+/i.test(text)) {
+    const match = text.trim().match(/^(?:!|\/)reponse\s+([\w-]+)\s*\|\s*([\s\S]+)$/i);
+    if (!match) {
+      await sock.sendMessage(jid, { text: 'Usage : !reponse tarifs | Nouveau texte de la réponse' });
+    } else {
+      quickReplies[match[1].toLowerCase()] = match[2].trim().slice(0, 1500);
+      persistRuntime();
+      logAdminEvent('réponse rapide modifiée', jid, match[1].toLowerCase());
+      await sock.sendMessage(jid, { text: `Réponse rapide !${match[1].toLowerCase()} enregistrée.` });
+    }
+    return true;
+  }
+  if (fromAdmin && /^(?:!|\/)journal$/i.test(text)) {
+    const lines = adminEvents.slice(-10).reverse().map((event) =>
+      `${new Date(event.at).toLocaleString('fr-FR')} · ${event.type} · ${event.phone} · ${event.detail}`
+    );
+    await sock.sendMessage(jid, { text: lines.length ? `Journal récent :\n${lines.join('\n')}` : 'Le journal est vide.' });
+    return true;
+  }
+  if (fromAdmin && /^(?:!|\/)statuts$/i.test(text)) {
+    const lines = scheduledStatuses.map((job) =>
+      `${job.id} · ${formatStatusDate(job.scheduledAt)} · ${job.caption || '[média]'}`
+    );
+    await sock.sendMessage(jid, { text: lines.length ? `Statuts programmés :\n${lines.join('\n')}\nAnnuler : !annulerstatut ID` : 'Aucun statut programmé.' });
+    return true;
+  }
+  const cancelScheduled = text.trim().match(/^(?:!|\/)annulerstatut\s+([\w-]+)$/i);
+  if (fromAdmin && cancelScheduled) {
+    const id = cancelScheduled[1];
+    const timer = scheduledStatusTimers.get(id);
+    if (timer) clearTimeout(timer);
+    scheduledStatusTimers.delete(id);
+    const before = scheduledStatuses.length;
+    scheduledStatuses = scheduledStatuses.filter((job) => job.id !== id);
+    persistRuntime();
+    if (before !== scheduledStatuses.length) logAdminEvent('statut programmé annulé', jid, id);
+    await sock.sendMessage(jid, { text: before === scheduledStatuses.length ? 'Aucun statut avec cet identifiant.' : `Statut ${id} annulé.` });
+    return true;
+  }
+  const reset = text.trim().match(/^(?:!|\/)reset(?:\s+(\d{8,15}))?$/i);
+  if (reset) {
+    let target = jid;
+    if (reset[1]) {
+      if (!fromAdmin) {
+        await sock.sendMessage(jid, { text: 'La réinitialisation d’un autre contact est réservée à l’administrateur.' });
+        return true;
+      }
+      target = reset[1] + '@s.whatsapp.net';
+    }
+    conversationHistory.delete(target);
+    await sock.sendMessage(jid, { text: reset[1] && fromAdmin ? `Mémoire effacée pour ${reset[1]}.` : 'Mémoire de conversation effacée.' });
+    return true;
+  }
+
+  if (/^(?:!|\/)?confirmer\s+statut$/i.test(text)) {
+    if (!fromAdmin) {
+      await sock.sendMessage(jid, { text: 'Cette commande est réservée à l’administrateur.' });
+      return true;
+    }
+    if (!pendingStatus) {
+      await sock.sendMessage(jid, { text: 'Aucun statut en attente de confirmation.' });
+      return true;
+    }
+    const draft = pendingStatus;
+    pendingStatus = null;
+    if (draft.scheduledAt) {
+      const job = { ...draft, id: `st-${Date.now()}` };
+      scheduledStatuses.push(job);
+      persistRuntime();
+      scheduleStatusJob(job);
+      logAdminEvent('statut programmé', jid, `${job.id}; ${job.scheduledAt}`);
+      await sock.sendMessage(jid, { text: `✅ Statut programmé pour ${formatStatusDate(job.scheduledAt)} (ID ${job.id}).` });
+    } else {
+      try {
+        const count = await publishStatus(draft);
+        logAdminEvent('statut publié', jid, `${count} destinataires`);
+        await sock.sendMessage(jid, { text: `✅ Statut publié pour ${count} destinataire(s).` });
+      } catch (e) {
+        logAdminEvent('échec publication statut', jid, e?.message || e);
+        await sock.sendMessage(jid, { text: `❌ Publication échouée : ${e?.message || e}` });
+      }
+    }
+    return true;
+  }
+  if (/^(?:!|\/)?annuler\s+statut$/i.test(text)) {
+    if (!fromAdmin) {
+      await sock.sendMessage(jid, { text: 'Cette commande est réservée à l’administrateur.' });
+      return true;
+    }
+    pendingStatus = null;
+    await sock.sendMessage(jid, { text: 'Brouillon de statut annulé.' });
+    return true;
+  }
+
+  if (/^(?:!|\/)?(?:statut|status)(?:\b|$)/i.test(text)) {
+    if (!fromAdmin) {
+      await sock.sendMessage(jid, { text: 'Cette commande est réservée à l’administrateur.' });
+      return true;
+    }
+    if (pendingStatus) {
+      await sock.sendMessage(jid, { text: 'Un brouillon est déjà en attente. Réponds confirmer statut ou annuler statut avant d’en préparer un autre.' });
+      return true;
+    }
+    const request = parseStatusCommand(text);
+    const mediaType = getMediaType(msg);
+    if (!request || (!request.caption && !mediaType)) {
+      await sock.sendMessage(jid, { text: 'Usage : statut: texte | statut connus: texte | statut liste: texte | statut dans 15m: texte. Ajoute une photo/vidéo avec cette légende pour un statut média.' });
+      return true;
+    }
+    if (request.caption.length > 700) {
+      await sock.sendMessage(jid, { text: 'Le texte/légende du statut ne peut pas dépasser 700 caractères.' });
+      return true;
+    }
+    const recipients = recipientsForAudience(request.audience);
+    if (!recipients.length) {
+      await sock.sendMessage(jid, { text: request.audience === 'list'
+        ? 'La liste est vide. Configure STATUS_RECIPIENTS (numéros séparés par des virgules) dans Render.'
+        : 'Aucun contact connu. Cette audience se remplit quand des contacts écrivent au bot.' });
+      return true;
+    }
+    const draft = {
+      caption: request.caption,
+      audience: request.audience,
+      recipients,
+      scheduledAt: request.scheduledAt || null,
+      mediaType: mediaType === 'image' || mediaType === 'video' ? mediaType : null,
+      mediaBase64: null,
+    };
+    if (draft.mediaType) {
+      try {
+        const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+          logger,
+          reuploadRequest: sock.updateMediaMessage,
+        });
+        if (!buffer?.length || buffer.length > 64 * 1024 * 1024) {
+          await sock.sendMessage(jid, { text: 'Média vide ou supérieur à 64 Mo ; statut non préparé.' });
+          return true;
+        }
+        draft.mediaBase64 = Buffer.from(buffer).toString('base64');
+      } catch (e) {
+        await sock.sendMessage(jid, { text: `Impossible de récupérer le média : ${e?.message || e}` });
+        return true;
+      }
+    }
+    pendingStatus = draft;
+    const audienceName = request.audience === 'list' ? 'liste configurée' : 'contacts connus';
+    const timing = draft.scheduledAt
+      ? `Programmation : ${formatStatusDate(draft.scheduledAt)}`
+      : 'Publication immédiate après confirmation';
+    await sock.sendMessage(jid, {
+      text: `Aperçu du statut${draft.mediaType ? ` (${draft.mediaType})` : ''}\n${draft.caption || '[sans légende]'}\nAudience : ${audienceName} (${recipients.length})\n${timing}\n\nRéponds « confirmer statut » pour valider ou « annuler statut » pour abandonner.`,
+    });
+    return true;
+  }
+
+  if (maintenanceMode && !fromAdmin) {
+    await sock.sendMessage(jid, { text: 'Le service est temporairement en maintenance. Réessaie un peu plus tard.' });
+    return true;
+  }
+  const quickKey = lower.match(/^!(\w[\w-]*)$/)?.[1];
+  if (quickKey && quickReplies[quickKey]) {
+    await sock.sendMessage(jid, { text: quickReplies[quickKey] });
+    return true;
+  }
+  return false;
+}
 
 function scheduleReconnect(ms, reason) {
   if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -224,8 +605,17 @@ async function notifyAdminDeposit(clientPhone, clientJid) {
     "\n\n(Tu peux aussi m'écrire normalement pour toute autre question CMR SCHOOL.)";
   const key = String(clientPhone).replace(/\D/g, '') || clientPhone;
   pendingDeposits.set(key, { jid: clientJid, at: Date.now() });
+  logAdminEvent('paiement à vérifier', clientJid, displayPhone);
   await sock.sendMessage(ADMIN_JID, { text: adminMsg });
   console.log('[DEPOT] Alerte →', ADMIN_NUMBER, '| client', displayPhone);
+}
+
+async function escalateToHuman(jid, text) {
+  const previous = escalationThrottle.get(jid) || 0;
+  if (Date.now() - previous < 30 * 60 * 1000) return;
+  escalationThrottle.set(jid, Date.now());
+  logAdminEvent('demande humaine', jid, text);
+  await notifyAdmin(`🔔 Intervention humaine demandée par ${jidToPhone(jid)} :\n${String(text).slice(0, 400)}`);
 }
 
 async function loadAuthState() {
@@ -345,42 +735,6 @@ async function startBot() {
         const lower = (text || '').toLowerCase();
         const fromAdmin = isAdminJid(jid);
 
-        if (/^(?:(?:!|\/)(?:statut|status)(?:\s|[:\-]|$)|(?:statut|status)(?:\s*[:\-]\s*|$))/i.test(text)) {
-          if (!fromAdmin) {
-            await sock.sendMessage(jid, { text: 'Cette commande est réservée à l’administrateur.' });
-            continue;
-          }
-          const statusText = parseStatusCommand(text);
-          if (!statusText) {
-            await sock.sendMessage(jid, { text: 'Usage : statut: Ton texte ici' });
-            continue;
-          }
-          if (statusText.length > 700) {
-            await sock.sendMessage(jid, { text: 'Le statut texte ne peut pas dépasser 700 caractères.' });
-            continue;
-          }
-          if (statusRecipients.size === 0) {
-            await sock.sendMessage(jid, {
-              text: 'Je ne connais encore aucun contact destinataire. Les contacts doivent être synchronisés ou m’avoir déjà écrit.',
-            });
-            continue;
-          }
-          try {
-            await sock.sendMessage(
-              'status@broadcast',
-              { text: statusText },
-              { broadcast: true, statusJidList: [...statusRecipients] }
-            );
-            await sock.sendMessage(jid, {
-              text: `✅ Statut publié pour ${statusRecipients.size} contact(s).`,
-            });
-          } catch (e) {
-            console.error('[STATUS] Publication échouée:', e?.message || e);
-            await sock.sendMessage(jid, { text: '❌ Échec de publication du statut. Vérifie les logs Render.' });
-          }
-          continue;
-        }
-
         if (fromAdmin && text) {
           const decision = parseAdminDecision(text);
           if (decision) {
@@ -431,6 +785,17 @@ async function startBot() {
           continue;
         }
 
+        if (!fromAdmin && getMediaType(msg) === 'image' && /momo|orange|transfert|payment|deposit|dép[oô]t/i.test(text || '')) {
+          await notifyAdminDeposit(jidToPhone(jid), jid);
+          await sock.sendMessage(jid, { text: 'Capture reçue. Vérification en cours.' });
+          continue;
+        }
+
+        if (!fromAdmin && /\b(humain|conseiller|agent humain|parler à quelqu|réclamation|plainte|urgence|urgent)\b/i.test(text)) {
+          await escalateToHuman(jid, text);
+        }
+        if (await handleControlCommand(msg, jid, text, fromAdmin)) continue;
+
         if (lower === 'ping') {
           await sock.sendMessage(jid, { text: 'Pong ✅' });
           continue;
@@ -440,7 +805,7 @@ async function startBot() {
             text:
               '*' +
               BOT_NAME +
-              '*\nhttps://cmr-school.online\nOffres, tarifs, inscription, paiement.\nDépôt fait ? Écrivez: J\'ai effectué un dépôt',
+              '*\nhttps://cmr-school.online\nOffres, tarifs, inscription, paiement.\nRaccourcis : !tarifs, !inscription, !contact.\nDépôt fait ? Écrivez: J\'ai effectué un dépôt',
           });
           continue;
         }
@@ -448,14 +813,10 @@ async function startBot() {
         await sock.sendPresenceUpdate('composing', jid).catch(() => {});
 
         if (getMediaType(msg) === 'image') {
-          if (!fromAdmin && (isDepositClaim(text) || /momo|orange|transfert|payment/i.test(text || ''))) {
-            await notifyAdminDeposit(jidToPhone(jid), jid);
-            await sock.sendMessage(jid, { text: 'Capture reçue. Vérification en cours.' });
-            continue;
-          }
           const reply = await askAI(
             'Image + légende: ' + (text || '') + ' — cadre CMR SCHOOL uniquement.',
-            lang
+            lang,
+            jid
           );
           await sock.sendMessage(jid, { text: reply });
           continue;
@@ -464,7 +825,8 @@ async function startBot() {
         if (!text) continue;
         const reply = await askAI(
           wantsPdf(text) ? text + '\nFiche structurée CMR SCHOOL si pertinent.' : text,
-          lang
+          lang,
+          jid
         );
         if (wantsPdf(text) && reply.length > 60) {
           try {
@@ -483,11 +845,13 @@ async function startBot() {
         }
       } catch (err) {
         console.error('[ERR] handler', err?.message || err);
+        logAdminEvent('erreur handler', msg.key?.remoteJid, err?.message || err);
       }
     }
   });
 }
 
+scheduleAllStatuses();
 startBot().catch((e) => {
   console.error('[ERR] start', e);
   scheduleReconnect(5000, 'start');

@@ -12,13 +12,25 @@ Agent IA WhatsApp **gratuit** — sans préfixe, prompt configurable, déploieme
 | `SYSTEM_PROMPT` | Recommandé | Rôle de l'agent **avant** la première utilisation |
 | `BOT_NAME` | Non | Nom du bot (défaut: CMR AI Agent) |
 | `PORT` | Non | Laissé à Render |
+| `STATUS_RECIPIENTS` | Non | Numéros WhatsApp séparés par des virgules pour l’audience `liste` |
+| `BOT_DATA_DIR` | Non | Dossier des programmations, réglages et journal (défaut : `./data`) |
 
 Sur **Render**, tu ne crées pas de fichier `.env` : tu ajoutes chaque variable dans **Environment**.
 Si un modèle échoue, l’agent essaie le suivant dans cet ordre. Les modèles partagent le quota Gemini de ta clé/projet : un quota épuisé globalement peut bloquer toute la chaîne.
 
-## Statut WhatsApp (administrateur)
+## Fonctions et commandes
 
-Depuis le numéro configuré dans `ADMIN_NUMBER`, envoie au bot `statut: Ton texte ici` (ou `!statut Ton texte ici`) pour publier un statut texte. La commande est réservée à l’administrateur et limitée à 700 caractères. L’audience comprend les contacts WhatsApp qui ont déjà écrit au bot depuis son dernier démarrage ; elle n’est pas automatiquement élargie aux contacts inconnus. Baileys requiert une liste de JID destinataires pour publier un statut.
+Les commandes admin sont accessibles uniquement depuis le numéro `ADMIN_NUMBER`.
+
+- **Statuts avec aperçu obligatoire** : `statut: texte`, `statut connus: texte` ou `statut liste: texte`. Envoie une image ou une vidéo avec cette commande en légende pour préparer un statut média. Le bot affiche l’aperçu et l’audience ; `confirmer statut` publie, `annuler statut` abandonne. La légende est limitée à 700 caractères et le bot refuse les fichiers de plus de 64 Mo. WhatsApp limite les vidéos de statut à 90 secondes ([aide WhatsApp](https://faq.whatsapp.com/454876960047011)).
+- **Audience connue** : contacts directs ayant déjà écrit au bot. **Audience liste** : numéros indiqués dans `STATUS_RECIPIENTS`, séparés par des virgules, au format international sans `+`.
+- **Programmation** : `statut dans 15m: texte` prépare un statut dans 15 minutes. Après `confirmer statut`, il est ajouté à la file. `!statuts` liste les publications prévues et `!annulerstatut ID` en supprime une. Les horaires acceptés vont d’une minute à sept jours.
+- **Réponses rapides** : les clients peuvent écrire `!tarifs`, `!inscription` ou `!contact`. L’admin peut lister les clés avec `!reponses` et changer une réponse avec `!reponse tarifs | nouveau texte`.
+- **Mode maintenance** : `!maintenance on` / `!maintenance off`, ou les raccourcis `!pause` et `!resume`. Les dépôts restent signalés à l’admin.
+- **Mémoire courte** : l’agent garde jusqu’à six échanges par conversation pendant la vie du processus. `!reset` efface sa propre mémoire ; l’admin peut faire `!reset NUMERO` pour celle d’un contact.
+- **Intervention humaine et journal** : les demandes de conseiller, réclamations et urgences déclenchent une notification admin, limitée à une par contact toutes les 30 minutes. `!journal` affiche les dix derniers événements.
+
+L’état opérationnel (contacts connus, réponses rapides, mode maintenance, tâches programmées et journal) est stocké dans `BOT_DATA_DIR`. Sur un hébergement à disque éphémère, il peut être perdu au redéploiement ; configure un volume persistant et règle `BOT_DATA_DIR` sur son point de montage si tu veux conserver ces données. La mémoire de conversation, elle, reste volontairement en RAM et s’efface au redémarrage.
 
 ---
 
