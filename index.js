@@ -20,7 +20,6 @@ const BOT_NAME = process.env.BOT_NAME || 'CMR SCHOOL';
 const OWNER = (process.env.OWNER_NUMBER || '').replace(/\D/g, '');
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const REPLY_IN_GROUPS = (process.env.REPLY_IN_GROUPS || 'false').toLowerCase() === 'true';
-
 const ADMIN_NUMBER = (process.env.ADMIN_NUMBER || '237698877771').replace(/\D/g, '');
 const ADMIN_JID = ADMIN_NUMBER + '@s.whatsapp.net';
 
@@ -34,30 +33,15 @@ const GEMINI_MODELS = [
 
 const DEFAULT_SYSTEM_PROMPT = `Tu es l'agent officiel de CMR SCHOOL (https://cmr-school.online).
 Tu réponds uniquement à propos de CMR SCHOOL, ses offres, tarifs, inscription, paiement et fonctionnement.
-Style : français ou anglais selon le message, court, clair, adapté à WhatsApp. Tu es professionnel et encourageant.
+Style : français ou anglais selon le message, court, clair, adapté à WhatsApp.
 
-=== CONNAISSANCES AUTORISÉES (ne sors pas de ce cadre) ===
 Site : https://cmr-school.online
-Slogan : Comprendre. Progresser. Réussir. / Comprendre aujourd'hui. Réussir demain.
-Public : élèves Seconde, Première, Terminale (Cameroun) — Maths, Physique, Chimie.
-Canaux : Web, WhatsApp, Telegram.
-
-Offres :
-1) CMR Fiches — supports structurés chapitre par chapitre, livraison WhatsApp ou Telegram. Paiement PayPal sécurisé sur le site. Pour MTN MoMo / Orange Money : contacter WhatsApp avant tout versement.
-2) CMR Répétitions — 3 séances/semaine · 2 h 30, Maths/Physique/Chimie, jusqu'à 4 séances avant examens. Tarifs indicatifs : ~20 000 FCFA/mois (2nde), ~30 000 (1ère), ~40 000 (Tle). Le conseiller confirme le montant exact.
-3) CMR Pack — fiches + répétitions, suivi parent possible, prix négociable dès 3 enfants.
-
-Contact inscription / Mobile Money : WhatsApp +237 677 152 300.
-Méthode : identifier le besoin → bon support → ancrer les progrès.
-
-=== RÈGLES ===
-- Si la question n'a AUCUN lien avec CMR SCHOOL / le site / l'inscription / le paiement : dis poliment que tu es l'assistant CMR SCHOOL et propose de parler des offres ou du site.
-- Tu n'inventes pas d'autres tarifs, numéros ou services hors de cette fiche.
-- Tu ne confirmes JAMAIS qu'un paiement est validé tant que l'administrateur ne t'a pas donné la permission (géré automatiquement par le système).
-- Pour les questions pédagogiques générales hors CMR SCHOOL, oriente vers les répétitions / fiches CMR SCHOOL.`;
+Offres : CMR Fiches, CMR Répétitions (~20k/30k/40k FCFA selon classe), CMR Pack.
+Contact : WhatsApp +237 677 152 300. PayPal ou Mobile Money.
+Tu ne confirmes jamais un paiement sans validation admin (gérée par le système).
+Hors sujet CMR SCHOOL : recentre poliment sur le site et les offres.`;
 
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT;
-
 const logger = pino({ level: 'silent' });
 const AUTH_DIR = path.join(__dirname, 'auth_info');
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
@@ -75,43 +59,39 @@ const pendingDeposits = new Map();
 
 function detectLang(text) {
   const t = (text || '').toLowerCase();
-  const en = /\b(the|what|how|why|please|help|hello|hi|payment|deposit)\b/;
-  const fr = /\b(le|la|les|des|une|est|pour|avec|comment|bonjour|salut|depot|paiement)\b/;
-  if (en.test(t) && !fr.test(t)) return 'en';
-  if (fr.test(t)) return 'fr';
+  if (/\b(the|what|how|payment|deposit|hello)\b/.test(t) && !/\b(le|la|bonjour|paiement)\b/.test(t)) return 'en';
+  if (/\b(le|la|bonjour|paiement|depot|offre)\b/.test(t)) return 'fr';
   return null;
 }
 
 function isDepositClaim(text) {
   const t = (text || '').toLowerCase();
-  const patterns = [
-    /d[eé]pos[eé]/i,
+  return [
+    /d[eé]pos/i,
     /d[eé]p[oô]t/i,
-    /j'?ai pay[eé]/i,
-    /j'?ai vers[eé]/i,
-    /j'?ai envoy[eé]/i,
-    /j'?ai effectu[eé]/i,
-    /paiement (effectu[eé]|fait|ok|r[eé]ussi)/i,
-    /souscription pay/i,
+    /j'?ai pay/i,
+    /j'?ai vers/i,
+    /j'?ai envoy/i,
+    /j'?ai effectu/i,
+    /paiement/i,
     /momo/i,
     /orange money/i,
     /transfert/i,
-    /i (paid|sent|transferred|deposited)/i,
+    /i paid/i,
     /payment (done|sent|completed)/i,
-  ];
-  return patterns.some((re) => re.test(t));
+  ].some((re) => re.test(t));
 }
 
 function parseAdminDecision(text) {
   const t = (text || '').trim().toLowerCase();
-  const m = t.match(/\b(ok|oui|valider?|confirm(?:e|er)?|yes|approve)\s*[:\-]?\s*(\d{8,15})\b/i);
+  const m = t.match(/\b(ok|oui|valider?|confirm(?:e|er)?|yes)\s*[:\-]?\s*(\d{8,15})\b/i);
   if (m) return { decision: 'approve', phone: m[2].replace(/\D/g, '') };
-  const r = t.match(/\b(non|refuser?|reject|no)\s*[:\-]?\s*(\d{8,15})\b/i);
+  const r = t.match(/\b(non|refuser?|no)\s*[:\-]?\s*(\d{8,15})\b/i);
   if (r) return { decision: 'reject', phone: r[2].replace(/\D/g, '') };
-  if (/^(ok|oui|valider?|yes)$/i.test(t) && pendingDeposits.size === 1) {
+  if (/^(ok|oui|yes)$/i.test(t) && pendingDeposits.size === 1) {
     return { decision: 'approve', phone: pendingDeposits.keys().next().value };
   }
-  if (/^(non|refuser?|no)$/i.test(t) && pendingDeposits.size === 1) {
+  if (/^(non|no)$/i.test(t) && pendingDeposits.size === 1) {
     return { decision: 'reject', phone: pendingDeposits.keys().next().value };
   }
   return null;
@@ -126,7 +106,6 @@ function jidToPhone(jid) {
 }
 
 function isAdminJid(jid) {
-  if (!jid) return false;
   return jidToPhone(jid) === ADMIN_NUMBER || jid === ADMIN_JID;
 }
 
@@ -137,8 +116,7 @@ if (GEMINI_KEY) {
   activeModelName = GEMINI_MODELS[0];
   console.log('[OK] Gemini —', GEMINI_MODELS.join(' → '));
 } else console.log('[WARN] GEMINI_API_KEY absente');
-
-console.log('[OK] ADMIN alertes dépôt:', ADMIN_NUMBER);
+console.log('[OK] ADMIN dépôts:', ADMIN_NUMBER);
 
 function getModel(name) {
   return genAI.getGenerativeModel({ model: name, systemInstruction: SYSTEM_PROMPT });
@@ -150,30 +128,25 @@ async function generateWithFallback(parts) {
   for (const name of GEMINI_MODELS) {
     try {
       const result = await getModel(name).generateContent(parts);
-      const text = result.response.text();
       if (activeModelName !== name) {
         activeModelName = name;
         console.log('[OK] Modèle actif:', name);
       }
-      return text || '...';
+      return result.response.text() || '...';
     } catch (e) {
       lastErr = e;
-      console.error('[WARN] modèle', name, e.message?.slice(0, 120));
+      console.error('[WARN] modèle', name, e.message?.slice(0, 100));
     }
   }
   throw lastErr || new Error('Gemini échoué');
 }
 
 async function askAI(userMessage, lang) {
-  if (!genAI) {
-    return lang === 'en'
-      ? 'Set GEMINI_API_KEY on Render.'
-      : 'Ajoute GEMINI_API_KEY sur Render.';
-  }
+  if (!genAI) return 'Ajoute GEMINI_API_KEY sur Render.';
   const prefix =
     lang === 'en'
-      ? 'Reply in English. Short WhatsApp style. Stay strictly on CMR SCHOOL topics.\n\n'
-      : 'Réponds en français. Style WhatsApp court. Reste strictement sur CMR SCHOOL.\n\n';
+      ? 'English, short, CMR SCHOOL only.\n\n'
+      : 'Français, court, uniquement CMR SCHOOL.\n\n';
   try {
     return await generateWithFallback(prefix + userMessage);
   } catch (e) {
@@ -191,7 +164,6 @@ function extractText(msg) {
     m.conversation ||
     m.extendedTextMessage?.text ||
     m.imageMessage?.caption ||
-    m.videoMessage?.caption ||
     m.documentMessage?.caption ||
     m.documentWithCaptionMessage?.message?.documentMessage?.caption ||
     ''
@@ -212,10 +184,8 @@ function isGroupJid(jid) {
 function isBroadcast(jid) {
   return !jid || jid === 'status@broadcast' || jid.endsWith('@broadcast') || jid.endsWith('@newsletter');
 }
-
 function wantsPdf(text) {
-  const t = (text || '').toLowerCase();
-  return /\b(pdf|fiche|fichier|document)\b/.test(t);
+  return /\b(pdf|fiche|fichier|document)\b/i.test(text || '');
 }
 
 let sock = null;
@@ -223,10 +193,11 @@ let waReady = false;
 let pairingRequested = false;
 let lastIncomingJid = null;
 let reconnectTimer = null;
+let bootId = 0;
 
 function scheduleReconnect(ms, reason) {
   if (reconnectTimer) clearTimeout(reconnectTimer);
-  console.log('[INFO] Reconnexion dans ' + ms / 1000 + 's (' + reason + ')');
+  console.log('[INFO] Reconnexion dans', ms / 1000, 's —', reason);
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     startBot().catch((e) => console.error('[ERR] restart', e.message));
@@ -241,13 +212,10 @@ async function notifyAdminDeposit(clientPhone, clientJid) {
     " affirme avoir effectué un dépôt d'argent sur l'un de vos numéros de téléphone, veuillez vérifier et me donner la permission de lui confirmer le succès de sa souscription.\n\n" +
     'Pour valider : ok ' +
     displayPhone +
-    '\n' +
-    'Pour refuser : non ' +
+    '\nPour refuser : non ' +
     displayPhone;
-
   const key = String(clientPhone).replace(/\D/g, '') || clientPhone;
   pendingDeposits.set(key, { jid: clientJid, at: Date.now() });
-
   await sock.sendMessage(ADMIN_JID, { text: adminMsg });
   console.log('[DEPOT] Alerte →', ADMIN_NUMBER, '| client', displayPhone);
 }
@@ -259,9 +227,9 @@ app.get('/', (req, res) => {
       BOT_NAME +
       '</h2><p>WhatsApp: <b>' +
       (waReady ? 'CONNECTÉ' : 'hors ligne') +
-      '</b></p><p>Admin: <b>' +
+      '</b></p><p>Admin: ' +
       ADMIN_NUMBER +
-      '</b></p>'
+      '</p>'
   );
 });
 app.get('/health', (req, res) =>
@@ -270,9 +238,16 @@ app.get('/health', (req, res) =>
 app.listen(PORT, () => console.log('[OK] HTTP port', PORT));
 
 async function startBot() {
+  const myBoot = ++bootId;
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
-  console.log('[OK] Baileys', version.join('.'), '| OWNER=', OWNER || '(vide)', '| ADMIN=', ADMIN_NUMBER);
+  const registered = !!state.creds?.registered;
+
+  console.log('----------------------------------------');
+  console.log('[BOOT]', myBoot, '| Baileys', version.join('.'));
+  console.log('[BOOT] OWNER_NUMBER =', OWNER || '(VIDE — pairing impossible)');
+  console.log('[BOOT] registered (session sauvée) =', registered);
+  console.log('----------------------------------------');
 
   sock = makeWASocket({
     version,
@@ -291,40 +266,76 @@ async function startBot() {
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect } = update;
+    if (myBoot !== bootId) return;
+    const { connection, lastDisconnect, qr } = update;
 
+    if (connection) console.log('[CONN] état =', connection);
+
+    // Pairing uniquement si pas encore enregistré
     if (!sock.authState.creds.registered && OWNER && !pairingRequested) {
       pairingRequested = true;
       setTimeout(async () => {
+        if (myBoot !== bootId) return;
+        if (sock.authState.creds.registered) {
+          console.log('[PAIR] Déjà registered, pas de nouveau code');
+          return;
+        }
         try {
+          console.log('[PAIR] Demande code pour', OWNER, '(WhatsApp Business OK)');
           const code = await sock.requestPairingCode(OWNER);
           const pretty = code.length === 8 ? code.slice(0, 4) + '-' + code.slice(4) : code;
-          console.log('\n*** CODE DE PAIRING:', pretty, '***\n');
+          console.log('');
+          console.log('******** CODE DE PAIRING ********');
+          console.log('         ', pretty);
+          console.log('********************************');
+          console.log('WhatsApp Business > Paramètres > Appareils connectés');
+          console.log('> Connecter un appareil > Lier avec un numéro');
+          console.log('Entre ce code en MOINS d\'1 minute');
+          console.log('Ensuite attends: [CONN] état = open  puis  CONNECTÉ');
+          console.log('');
         } catch (e) {
           pairingRequested = false;
-          console.error('[ERR] pairing', e.message);
+          console.error('[PAIR] ERREUR:', e.message);
+          console.log('[PAIR] Vérifie OWNER_NUMBER = numéro Business sans + ni espace');
         }
-      }, 5000);
+      }, 6000);
     }
 
     if (connection === 'close') {
       waReady = false;
       const status = lastDisconnect?.error?.output?.statusCode;
+      const msg = lastDisconnect?.error?.message || '';
+      console.log('[CONN] FERMÉ status=', status, '|', msg.slice(0, 80));
+
       if (status === 515) {
+        console.log('[CONN] 515 = normal APRÈS un pairing réussi. Relance pour finaliser...');
         pairingRequested = false;
-        scheduleReconnect(2500, '515');
+        scheduleReconnect(3000, '515 post-pairing');
         return;
       }
       if (status === DisconnectReason.loggedOut || status === 401) {
-        console.log('[ERR] loggedOut');
+        console.log('[CONN] Session invalidée. Supprime les appareils liés sur le téléphone et re-pair.');
+        pairingRequested = false;
+        return;
+      }
+      if (status === 440) {
+        console.log('[CONN] 440 = appareil remplacé ailleurs. Re-pair nécessaire.');
         pairingRequested = false;
         return;
       }
       pairingRequested = false;
-      scheduleReconnect(4000, 'close');
+      scheduleReconnect(5000, 'close ' + status);
     } else if (connection === 'open') {
       waReady = true;
-      console.log('[OK]', BOT_NAME, 'CONNECTÉ | alertes dépôt →', ADMIN_NUMBER);
+      console.log('');
+      console.log('========================================');
+      console.log('  [OK] CONNECTÉ À WHATSAPP');
+      console.log('  Bot:', BOT_NAME);
+      console.log('  Alertes dépôt →', ADMIN_NUMBER);
+      console.log('========================================');
+      console.log('');
+    } else if (connection === 'connecting') {
+      console.log('[CONN] Connexion en cours...');
     }
   });
 
@@ -333,30 +344,27 @@ async function startBot() {
       try {
         storeMsg(msg);
         if (!msg.message || msg.key.fromMe) continue;
-
         const jid = msg.key.remoteJid;
         if (isBroadcast(jid)) continue;
         if (isGroupJid(jid) && !REPLY_IN_GROUPS) continue;
 
         const text = extractText(msg).trim();
         if (!text && !getMediaType(msg)) continue;
-
         lastIncomingJid = jid;
+
         const det = detectLang(text);
         if (det) langByJid.set(jid, det);
         const lang = langByJid.get(jid) || 'fr';
         const lower = (text || '').toLowerCase();
 
-        // ADMIN validation
         if (isAdminJid(jid) && text) {
           const decision = parseAdminDecision(text);
           if (decision) {
-            const key = decision.phone;
-            let entry = pendingDeposits.get(key);
-            let foundKey = key;
+            let entry = pendingDeposits.get(decision.phone);
+            let foundKey = decision.phone;
             if (!entry) {
               for (const [k, v] of pendingDeposits) {
-                if (k.endsWith(key) || key.endsWith(k)) {
+                if (k.endsWith(decision.phone) || decision.phone.endsWith(k)) {
                   entry = v;
                   foundKey = k;
                   break;
@@ -365,52 +373,36 @@ async function startBot() {
             }
             if (!entry) {
               await sock.sendMessage(jid, {
-                text:
-                  'Aucun dépôt en attente pour ' +
-                  key +
-                  '.\nEn attente: ' +
-                  ([...pendingDeposits.keys()].join(', ') || 'aucun'),
+                text: 'Aucun dépôt en attente pour ' + decision.phone,
               });
               continue;
             }
             if (decision.decision === 'approve') {
               await sock.sendMessage(entry.jid, {
                 text:
-                  '✅ Votre paiement a été confirmé. Bienvenue chez CMR SCHOOL ! Nous vous recontactons pour la suite.\nhttps://cmr-school.online',
+                  '✅ Votre paiement a été confirmé. Bienvenue chez CMR SCHOOL !\nhttps://cmr-school.online',
               });
-              await sock.sendMessage(jid, { text: '✅ Client ' + foundKey + ' : souscription confirmée.' });
+              await sock.sendMessage(jid, { text: '✅ Client ' + foundKey + ' confirmé.' });
               pendingDeposits.delete(foundKey);
-              console.log('[DEPOT] VALIDÉ', foundKey);
             } else {
               await sock.sendMessage(entry.jid, {
-                text:
-                  "❌ Nous n'avons pas encore retrouvé votre dépôt. Merci de vérifier le numéro / montant ou d'envoyer la capture du transfert, puis réécrivez-nous.",
+                text: '❌ Dépôt non retrouvé. Vérifiez et réenvoyez une capture.',
               });
-              await sock.sendMessage(jid, { text: '❌ Client ' + foundKey + ' : dépôt non confirmé.' });
+              await sock.sendMessage(jid, { text: '❌ Client ' + foundKey + ' refusé.' });
               pendingDeposits.delete(foundKey);
-              console.log('[DEPOT] REFUSÉ', foundKey);
             }
             continue;
           }
         }
 
-        // Client dépôt
         if (text && isDepositClaim(text) && !isAdminJid(jid)) {
-          const clientPhone = jidToPhone(jid);
           try {
-            await notifyAdminDeposit(clientPhone, jid);
+            await notifyAdminDeposit(jidToPhone(jid), jid);
             await sock.sendMessage(jid, {
-              text:
-                lang === 'en'
-                  ? 'Thank you. We notified the team to verify your payment. You will get a confirmation shortly.'
-                  : "Merci. Nous avons informé l'équipe pour vérifier votre dépôt. Vous recevrez une confirmation sous peu.",
+              text: "Merci. L'équipe vérifie votre dépôt. Confirmation sous peu.",
             });
           } catch (e) {
-            console.error('[ERR] notify admin', e.message);
-            await sock.sendMessage(jid, {
-              text:
-                'Votre message est reçu. Un conseiller va vérifier. Contact : +237 677 152 300',
-            });
+            await sock.sendMessage(jid, { text: 'Message reçu. Contact: +237 677 152 300' });
           }
           continue;
         }
@@ -424,7 +416,7 @@ async function startBot() {
             text:
               '*' +
               BOT_NAME +
-              '* — https://cmr-school.online\n\nJe réponds sur :\n• Offres (Fiches, Répétitions, Pack)\n• Tarifs & inscription\n• Paiement / Mobile Money\n\nSi vous avez déjà payé : "J\'ai effectué un dépôt".',
+              '*\nhttps://cmr-school.online\nOffres, tarifs, inscription, paiement.\nDépôt fait ? Écrivez: J\'ai effectué un dépôt',
           });
           continue;
         }
@@ -432,30 +424,21 @@ async function startBot() {
         await sock.sendPresenceUpdate('composing', jid).catch(() => {});
 
         if (getMediaType(msg) === 'image') {
-          if (isDepositClaim(text) || /momo|orange|reçu|recu|transfert|deposit|payment/i.test(text || '')) {
+          if (isDepositClaim(text) || /momo|orange|transfert|payment/i.test(text || '')) {
             await notifyAdminDeposit(jidToPhone(jid), jid);
-            await sock.sendMessage(jid, {
-              text: "Merci pour la capture. L'équipe vérifie votre dépôt et vous confirmera sous peu.",
-            });
+            await sock.sendMessage(jid, { text: 'Capture reçue. Vérification en cours.' });
             continue;
           }
-          const reply = await askAI(
-            'Image reçue, légende: "' +
-              (text || '(aucune)') +
-              '". Réponds uniquement dans le cadre CMR SCHOOL.',
-            lang
-          );
+          const reply = await askAI('Image + légende: ' + (text || '') + ' — cadre CMR SCHOOL uniquement.', lang);
           await sock.sendMessage(jid, { text: reply });
           continue;
         }
 
         if (!text) continue;
-
-        const prompt = wantsPdf(text)
-          ? text + '\n\nRédige une fiche claire liée à CMR SCHOOL si pertinent, sinon présente les offres.'
-          : text;
-        const reply = await askAI(prompt, lang);
-
+        const reply = await askAI(
+          wantsPdf(text) ? text + '\nFiche structurée CMR SCHOOL si pertinent.' : text,
+          lang
+        );
         if (wantsPdf(text) && reply.length > 60) {
           try {
             const pdfBuf = await textToPdf(text.slice(0, 50), reply);
@@ -463,7 +446,7 @@ async function startBot() {
               document: pdfBuf,
               mimetype: 'application/pdf',
               fileName: 'cmr-school-' + Date.now() + '.pdf',
-              caption: 'Document CMR SCHOOL',
+              caption: 'CMR SCHOOL',
             });
           } catch (e) {
             await sock.sendMessage(jid, { text: reply });
