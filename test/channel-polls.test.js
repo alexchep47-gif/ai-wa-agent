@@ -7,6 +7,7 @@ const {
   addLocalDays,
   buildDailyRecap,
   fallbackPollBatch,
+  getDailyPollSchedule,
   localDateTime,
   parseChannelInviteCode,
   parseGeneratedPollBatch,
@@ -32,6 +33,14 @@ test('utilise cinq créneaux valides et retombe sur les valeurs par défaut sino
 test('convertit les horaires Africa/Douala en UTC et gère le changement d’année', () => {
   assert.equal(localDateTime('2026-10-30', '08:00', 'Africa/Douala').toISOString(), '2026-10-30T07:00:00.000Z');
   assert.equal(addLocalDays('2026-12-31', 1), '2027-01-01');
+});
+
+test('après un redémarrage en journée, conserve les créneaux restants au lieu de tout reporter au lendemain', () => {
+  const afternoon = getDailyPollSchedule(new Date('2026-10-31T13:50:00.000Z'));
+  assert.deepEqual(afternoon, { dateKey: '2026-10-31', times: ['17:00', '20:00'] });
+
+  const afterLastSlot = getDailyPollSchedule(new Date('2026-10-31T19:31:00.000Z'));
+  assert.deepEqual(afterLastSlot, { dateKey: '2026-11-01', times: DEFAULT_TIMES });
 });
 
 test('la banque locale produit cinq sondages validés couvrant chaque catégorie', () => {

@@ -19,7 +19,7 @@ const {
   buildDailyPrompt,
   buildDailyRecap,
   fallbackPollBatch,
-  getLocalDateKey,
+  getDailyPollSchedule,
   localDateTime,
   parseChannelInviteCode,
   parseGeneratedPollBatch,
@@ -537,10 +537,15 @@ function formatPollPreview() {
 async function ensureDailyPollJobs() {
   if (!channelPollsEnabled || !waReady || !sock || !channelJid || !channelCanPost) return;
   if (pollGenerationPromise) return pollGenerationPromise;
-  const today = getLocalDateKey(new Date(), POLL_TIMEZONE);
-  const futureSlots = POLL_TIMES.filter((time) => localDateTime(today, time, POLL_TIMEZONE).getTime() > Date.now() + 2 * 60 * 1000);
-  const targetDate = futureSlots.length === POLL_TIMES.length ? today : addLocalDays(today, 1);
+  const plan = getDailyPollSchedule(new Date(), POLL_TIMES, POLL_TIMEZONE);
+  const targetDate = plan.dateKey;
   if (runtimeState.pollsGeneratedDate === targetDate) {
+    scheduleAllChannelPolls();
+    return;
+  }
+  if (scheduledPollJobs.some((job) => job.kind === 'poll' && job.dateKey === targetDate)) {
+    runtimeState.pollsGeneratedDate = targetDate;
+    persistRuntime();
     scheduleAllChannelPolls();
     return;
   }
@@ -556,14 +561,18 @@ async function ensureDailyPollJobs() {
       logAdminEvent('banque de secours quiz utilisée', ADMIN_JID, `${targetDate}: ${e?.message || e}`);
     }
     scheduledPollJobs = scheduledPollJobs.filter((job) => job.dateKey >= targetDate);
-    const newJobs = polls.map((poll, index) => ({
-      id: `quiz-${targetDate}-${index + 1}`,
-      kind: 'poll',
-      format: DAILY_INTERACTION_FORMATS[index],
-      dateKey: targetDate,
-      poll,
-      scheduledAt: localDateTime(targetDate, POLL_TIMES[index], POLL_TIMEZONE).toISOString(),
-    }));
+    const newJobs = polls.flatMap((poll, index) => {
+      const time = POLL_TIMES[index];
+      if (!plan.times.includes(time)) return [];
+      return [{
+        id: `quiz-${targetDate}-${index + 1}`,
+        kind: 'poll',
+        format: DAILY_INTERACTION_FORMATS[index],
+        dateKey: targetDate,
+        poll,
+        scheduledAt: localDateTime(targetDate, time, POLL_TIMEZONE).toISOString(),
+      }];
+    });
     const [lastHour, lastMinute] = POLL_TIMES[POLL_TIMES.length - 1].split(':').map(Number);
     const recapTotal = lastHour * 60 + lastMinute + 30;
     const recapDate = recapTotal >= 1440 ? addLocalDays(targetDate, 1) : targetDate;
