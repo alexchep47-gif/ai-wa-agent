@@ -27,6 +27,8 @@ Si un modèle échoue, l’agent essaie le suivant dans cet ordre. Les modèles 
 
 Les commandes admin sont accessibles depuis les numéros de `ADMIN_NUMBERS` (par défaut `237677152300`, `237698877771` et `237679126098`). Les alertes et notifications de paiement continuent d’être envoyées au numéro principal `ADMIN_NUMBER`. Si `ADMIN_NUMBERS` est déjà défini dans Render/Railway, ajoute aussi `237679126098` à cette variable : elle remplace la valeur par défaut du code.
 
+Les utilisateurs externes reçoivent des réponses limitées au contexte CMR SCHOOL. Si Gemini est temporairement indisponible, le bot n’expose pas l’erreur technique et les oriente poliment vers les offres et contacts CMR SCHOOL. Les numéros reconnus dans `ADMIN_NUMBERS` bénéficient d’un contexte IA polyvalent, sans restriction au sujet CMR SCHOOL.
+
 - **Statuts avec aperçu obligatoire** : `statut: texte`, `statut connus: texte` ou `statut liste: texte`. Envoie une image ou une vidéo avec cette commande en légende pour préparer un statut média. Le bot affiche l’aperçu et l’audience ; `confirmer statut` publie, `annuler statut` abandonne. La légende est limitée à 700 caractères et le bot refuse les fichiers de plus de 64 Mo. WhatsApp limite les vidéos de statut à 90 secondes ([aide WhatsApp](https://faq.whatsapp.com/454876960047011)).
 - **Audience connue** : contacts directs ayant déjà écrit au bot. **Audience liste** : numéros indiqués dans `STATUS_RECIPIENTS`, séparés par des virgules, au format international sans `+`.
 - **Programmation** : `statut dans 15m: texte` prépare un statut dans 15 minutes. Après `confirmer statut`, il est ajouté à la file. `!statuts` liste les publications prévues et `!annulerstatut ID` en supprime une. Les horaires acceptés vont d’une minute à sept jours.

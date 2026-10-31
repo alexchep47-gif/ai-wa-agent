@@ -27,6 +27,7 @@ const {
 } = require('./lib/channel-polls');
 const { canPublishToChannel, isAdminSender, parseAdminNumbers } = require('./lib/admin-numbers');
 const { DAILY_INTERACTION_FORMATS, sendNativeChannelInteraction } = require('./lib/channel-native');
+const { getAiFailureReply, getAiSystemInstruction } = require('./lib/ai-response');
 
 const PORT = process.env.PORT || 3000;
 const BOT_NAME = process.env.BOT_NAME || 'CMR SCHOOL';
@@ -280,16 +281,16 @@ async function generateWithFallback(parts, history = [], systemInstruction = SYS
   throw lastErr || new Error('Gemini échoué');
 }
 
-async function askAI(userMessage, lang, jid) {
-  if (!genAI) return 'Ajoute GEMINI_API_KEY sur Render.';
-  const prefix =
-    lang === 'en'
-      ? 'English, short, CMR SCHOOL only.\n\n'
-      : 'Français, court, uniquement CMR SCHOOL.\n\n';
+async function askAI(userMessage, lang, jid, isAdmin = false) {
+  if (!genAI) return getAiFailureReply(lang, isAdmin);
+  const prefix = isAdmin
+    ? (lang === 'en' ? 'English, concise and useful.\n\n' : 'Français, réponse concise et utile.\n\n')
+    : (lang === 'en' ? 'English, short, CMR SCHOOL only.\n\n' : 'Français, court, uniquement CMR SCHOOL.\n\n');
   const prompt = prefix + userMessage;
   const history = jid ? conversationHistory.get(jid) || [] : [];
   try {
-    const reply = await generateWithFallback(prompt, history);
+    const systemInstruction = getAiSystemInstruction({ isAdmin, clientSystemPrompt: SYSTEM_PROMPT });
+    const reply = await generateWithFallback(prompt, history, systemInstruction);
     if (jid) {
       const next = [
         ...history,
@@ -300,7 +301,8 @@ async function askAI(userMessage, lang, jid) {
     }
     return reply;
   } catch (e) {
-    return 'Erreur IA: ' + String(e.message).slice(0, 160);
+    console.error('[AI] Réponse indisponible:', e?.message || e);
+    return getAiFailureReply(lang, isAdmin);
   }
 }
 
@@ -1080,9 +1082,10 @@ async function startBot() {
 
         if (getMediaType(msg) === 'image') {
           const reply = await askAI(
-            'Image + légende: ' + (text || '') + ' — cadre CMR SCHOOL uniquement.',
+            'Image + légende: ' + (text || '') + (fromAdmin ? '' : ' — cadre CMR SCHOOL uniquement.'),
             lang,
-            jid
+            jid,
+            fromAdmin
           );
           await sock.sendMessage(jid, { text: reply });
           continue;
@@ -1092,7 +1095,8 @@ async function startBot() {
         const reply = await askAI(
           wantsPdf(text) ? text + '\nFiche structurée CMR SCHOOL si pertinent.' : text,
           lang,
-          jid
+          jid,
+          fromAdmin
         );
         if (wantsPdf(text) && reply.length > 60) {
           try {
