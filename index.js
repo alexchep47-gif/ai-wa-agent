@@ -37,6 +37,8 @@ const REPLY_IN_GROUPS = (process.env.REPLY_IN_GROUPS || 'false').toLowerCase() =
 const ADMIN_NUMBER = (process.env.ADMIN_NUMBER || '237698877771').replace(/\D/g, '');
 const ADMIN_NUMBERS = parseAdminNumbers(process.env.ADMIN_NUMBERS || '237677152300,237698877771,237679126098');
 const ADMIN_JID = ADMIN_NUMBER + '@s.whatsapp.net';
+const SESSION_API_TOKEN = process.env.SESSION_API_TOKEN || '';
+const SESSION_API_TOKEN_HEADER = 'x-session-token';
 const CHANNEL_URL = process.env.WHATSAPP_CHANNEL_URL || 'https://whatsapp.com/channel/0029VbC9sfi5q08hsj3JTp0W';
 const CHANNEL_INVITE_CODE = parseChannelInviteCode(CHANNEL_URL);
 const POLL_TIMES = parsePollTimes(process.env.POLL_TIMES);
@@ -170,7 +172,7 @@ function parseStatusCommand(text) {
     if (minutes < 1 || minutes > 10080) return null;
     return {
       caption: scheduled[3].trim(),
-      audience: 'known',
+      audience: 'all',
       scheduledAt: new Date(Date.now() + minutes * 60000).toISOString(),
     };
   }
@@ -178,7 +180,7 @@ function parseStatusCommand(text) {
   const textMatch = body.match(/^:\s*([\s\S]+)$/);
   const caption = (audience ? audience[2] : textMatch ? textMatch[1] : body.replace(/^[-:]\s*/, '')).trim();
   if (!caption) return null;
-  return { caption, audience: audience?.[1]?.toLowerCase() === 'liste' ? 'list' : 'known' };
+  return { caption, audience: audience ? (audience[1].toLowerCase() === 'liste' ? 'list' : 'known') : 'all' };
 }
 
 function recipientsForAudience(audience) {
@@ -345,6 +347,8 @@ function wantsPdf(text) {
 let sock = null;
 let waReady = false;
 let pairingRequested = false;
+let lastPairingCode = null;
+let pairingCodeExpiresAt = 0;
 let lastIncomingJid = null;
 let reconnectTimer = null;
 let bootId = 0;
@@ -370,8 +374,8 @@ async function notifyAdmin(text) {
 
 async function publishStatus(draft) {
   if (!sock || !waReady) throw new Error('WhatsApp non connecté');
-  const recipients = draft.recipients || recipientsForAudience(draft.audience);
-  if (!recipients.length) throw new Error('Audience vide');
+  const recipients = draft.recipients || (draft.audience === 'all' ? [] : recipientsForAudience(draft.audience));
+  if (draft.audience !== 'all' && !recipients.length) throw new Error('Audience vide');
   let content;
   if (draft.mediaType === 'image' || draft.mediaType === 'video') {
     content = {
@@ -381,10 +385,9 @@ async function publishStatus(draft) {
   } else {
     content = { text: draft.caption };
   }
-  await sock.sendMessage('status@broadcast', content, {
-    broadcast: true,
-    statusJidList: recipients,
-  });
+  const options = { broadcast: true };
+  if (recipients.length) options.statusJidList = recipients;
+  await sock.sendMessage('status@broadcast', content, options);
   return recipients.length;
 }
 
@@ -778,18 +781,18 @@ async function handleControlCommand(msg, jid, text, fromAdmin) {
     const request = parseStatusCommand(text);
     const mediaType = getMediaType(msg);
     if (!request || (!request.caption && !mediaType)) {
-      await sock.sendMessage(jid, { text: 'Usage : statut: texte | statut connus: texte | statut liste: texte | statut dans 15m: texte. Ajoute une photo/vidéo avec cette légende pour un statut média.' });
+      await sock.sendMessage(jid, { text: 'Usage : statut: texte (publie à la demande) | statut connus: texte | statut liste: texte | statut dans 15m: texte. Ajoute une photo/vidéo avec cette légende pour un statut média.' });
       return true;
     }
     if (request.caption.length > 700) {
       await sock.sendMessage(jid, { text: 'Le texte/légende du statut ne peut pas dépasser 700 caractères.' });
       return true;
     }
-    const recipients = recipientsForAudience(request.audience);
-    if (!recipients.length) {
+    const recipients = request.audience === 'all' ? [] : recipientsForAudience(request.audience);
+    if (request.audience !== 'all' && !recipients.length) {
       await sock.sendMessage(jid, { text: request.audience === 'list'
         ? 'La liste est vide. Configure STATUS_RECIPIENTS (numéros séparés par des virgules) dans Render.'
-        : 'Aucun contact connu. Cette audience se remplit quand des contacts écrivent au bot.' });
+        : 'Aucun contact connu pour cette audience. Utilise « statut: texte » pour publier à la demande.' });
       return true;
     }
     const draft = {
@@ -817,7 +820,7 @@ async function handleControlCommand(msg, jid, text, fromAdmin) {
       }
     }
     pendingStatus = draft;
-    const audienceName = request.audience === 'list' ? 'liste configurée' : 'contacts connus';
+    const audienceName = request.audience === 'all' ? 'statut WhatsApp (publication immédiate)' : (request.audience === 'list' ? 'liste configurée' : 'contacts connus');
     const timing = draft.scheduledAt
       ? `Programmation : ${formatStatusDate(draft.scheduledAt)}`
       : 'Publication immédiate après confirmation';
@@ -888,6 +891,19 @@ app.get('/', (req, res) => {
       '</b></p><p>Session: <b>locale (fichiers)</b></p>'
   );
 });
+app.get('/api/session', (req, res) => {
+  if (!SESSION_API_TOKEN || req.get(SESSION_API_TOKEN_HEADER) !== SESSION_API_TOKEN) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const pairingCode = pairingCodeExpiresAt > Date.now() ? lastPairingCode : null;
+  res.set('Cache-Control', 'no-store');
+  return res.json({
+    whatsapp: waReady ? 'connected' : 'waiting',
+    pairingCode,
+    pairingCodeExpiresAt: pairingCode ? new Date(pairingCodeExpiresAt).toISOString() : null,
+    connectedAccount: connectedAccountPhone(),
+  });
+});
 app.get('/health', (req, res) =>
   res.json({
     status: 'ok',
@@ -938,10 +954,9 @@ async function startBot() {
         if (myBoot !== bootId || sock.authState.creds.registered) return;
         try {
           const code = await sock.requestPairingCode(OWNER);
-          const pretty = code.length === 8 ? code.slice(0, 4) + '-' + code.slice(4) : code;
-          console.log('\n******** CODE DE PAIRING ********');
-          console.log('         ', pretty);
-          console.log('********************************\n');
+          lastPairingCode = code.length === 8 ? code.slice(0, 4) + '-' + code.slice(4) : code;
+          pairingCodeExpiresAt = Date.now() + 10 * 60 * 1000;
+          console.log('[PAIR] Code généré et disponible via l’interface de session protégée.');
         } catch (e) {
           pairingRequested = false;
           console.error('[PAIR] ERREUR:', e.message);

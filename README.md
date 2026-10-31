@@ -30,7 +30,7 @@ Les commandes admin sont accessibles depuis les numéros de `ADMIN_NUMBERS` (par
 Les utilisateurs externes reçoivent des réponses limitées au contexte CMR SCHOOL. Si Gemini est temporairement indisponible, le bot n’expose pas l’erreur technique et les oriente poliment vers les offres et contacts CMR SCHOOL. Les numéros reconnus dans `ADMIN_NUMBERS` bénéficient d’un contexte IA polyvalent, sans restriction au sujet CMR SCHOOL.
 
 - **Statuts avec aperçu obligatoire** : `statut: texte`, `statut connus: texte` ou `statut liste: texte`. Envoie une image ou une vidéo avec cette commande en légende pour préparer un statut média. Le bot affiche l’aperçu et l’audience ; `confirmer statut` publie, `annuler statut` abandonne. La légende est limitée à 700 caractères et le bot refuse les fichiers de plus de 64 Mo. WhatsApp limite les vidéos de statut à 90 secondes ([aide WhatsApp](https://faq.whatsapp.com/454876960047011)).
-- **Audience connue** : contacts directs ayant déjà écrit au bot. **Audience liste** : numéros indiqués dans `STATUS_RECIPIENTS`, séparés par des virgules, au format international sans `+`.
+- **Publication standard** : `statut: texte` publie directement le statut WhatsApp à la demande de l’administrateur, sans attendre qu’un contact externe ait écrit au bot. Les formes `statut connus:` et `statut liste:` restent disponibles pour cibler une audience précise.
 - **Programmation** : `statut dans 15m: texte` prépare un statut dans 15 minutes. Après `confirmer statut`, il est ajouté à la file. `!statuts` liste les publications prévues et `!annulerstatut ID` en supprime une. Les horaires acceptés vont d’une minute à sept jours.
 - **Réponses rapides** : les clients peuvent écrire `!tarifs`, `!inscription` ou `!contact`. L’admin peut lister les clés avec `!reponses` et changer une réponse avec `!reponse tarifs | nouveau texte`.
 - **Mode maintenance** : `!maintenance on` / `!maintenance off`, ou les raccourcis `!pause` et `!resume`. Les dépôts restent signalés à l’admin.
@@ -64,12 +64,9 @@ BOT_NAME       = CMR AI Agent
 Puis **Create Web Service** / **Deploy**.
 
 ### Étape 3 — Récupérer le code de pairing
-1. Dans Render, ouvre ton service → onglet **Logs**
+1. Ouvre l’interface privée `ai-wa-agent-session` ou lance le workflow GitHub Actions « Redémarrer Render et récupérer le pairing »
 2. Attends le démarrage (1–2 min)
-3. Cherche une ligne du type :
-   ```
-   🔑 CODE DE PAIRING : ABCD-EFGH
-   ```
+3. Le code apparaît dans l’interface privée de session, jamais dans les logs publics.
 4. Note ce code (il expire assez vite)
 
 ### Étape 4 — Lier WhatsApp sur ton iPhone
@@ -77,7 +74,7 @@ Puis **Create Web Service** / **Deploy**.
 2. Va dans **Réglages** → **Appareils connectés**
 3. Appuie sur **Connecter un appareil**
 4. En bas, choisis **Lier avec un numéro de téléphone** (pas le QR)
-5. Entre le **code de pairing** affiché dans les Logs Render
+5. Entre le **code de pairing** affiché uniquement dans l’interface privée de session (il n’est jamais écrit dans les logs GitHub Actions ni Render)
 6. Valide
 
 Tu dois voir dans les Logs :
