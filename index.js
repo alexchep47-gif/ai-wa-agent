@@ -28,6 +28,7 @@ const {
 const { canPublishToChannel, isAdminSender, parseAdminNumbers } = require('./lib/admin-numbers');
 const { DAILY_INTERACTION_FORMATS, sendNativeChannelInteraction } = require('./lib/channel-native');
 const { getAiFailureReply, getAiSystemInstruction } = require('./lib/ai-response');
+const { importSessionId, exportSessionId } = require('./lib/session-id');
 
 const PORT = process.env.PORT || 3000;
 const BOT_NAME = process.env.BOT_NAME || 'CMR SCHOOL';
@@ -73,8 +74,15 @@ Hors sujet CMR SCHOOL : recentre poliment sur le site et les offres.`;
 
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT;
 const logger = pino({ level: 'silent' });
-const AUTH_DIR = path.join(__dirname, 'auth_info');
-if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+const AUTH_DIR = process.env.AUTH_DIR || path.join(__dirname, 'auth_info');
+if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
+if (process.env.SESSION_ID) {
+  try {
+    if (importSessionId(process.env.SESSION_ID, AUTH_DIR)) console.log('[SESSION] SESSION_ID restaurée.');
+  } catch (e) {
+    console.error('[SESSION] SESSION_ID invalide :', e.message);
+  }
+}
 const DATA_DIR = process.env.BOT_DATA_DIR || path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 const STATE_FILE = path.join(DATA_DIR, 'bot_state.json');
@@ -890,6 +898,17 @@ app.get('/', (req, res) => {
       (waReady ? 'CONNECTÉ' : 'hors ligne') +
       '</b></p><p>Session: <b>locale (fichiers)</b></p>'
   );
+});
+app.get('/api/session/export', (req, res) => {
+  if (!SESSION_API_TOKEN || req.get(SESSION_API_TOKEN_HEADER) !== SESSION_API_TOKEN) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    res.set('Cache-Control', 'no-store');
+    return res.json({ sessionId: exportSessionId(AUTH_DIR) });
+  } catch (e) {
+    return res.status(409).json({ error: e.message });
+  }
 });
 app.get('/api/session', (req, res) => {
   if (!SESSION_API_TOKEN || req.get(SESSION_API_TOKEN_HEADER) !== SESSION_API_TOKEN) {

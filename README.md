@@ -97,3 +97,8 @@ L'agent répond **sans préfixe**.
 - La session WhatsApp est stockée dans les fichiers locaux `auth_info` (aucune base de données externe). Sur Render Free, le système de fichiers peut être éphémère : après un redémarrage ou un redéploiement, il faudra parfois **re-pairer**.
 - Les messages de **groupe** sont ignorés par défaut.
 - Ne partage jamais ta `GEMINI_API_KEY`.
+
+
+## SESSION_ID exportable
+
+Le bot accepte `SESSION_ID`, une archive Baileys compacte encodée en base64url. Au démarrage, elle est restaurée uniquement si `AUTH_DIR` est vide. L’endpoint protégé `/api/session/export` permet d’exporter la session active avec `SESSION_API_TOKEN`. Ne publie jamais cette valeur : elle donne accès à la session WhatsApp.
