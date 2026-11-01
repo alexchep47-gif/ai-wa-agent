@@ -355,6 +355,7 @@ function wantsPdf(text) {
 let sock = null;
 let waReady = false;
 let pairingRequested = false;
+let pairingResetInProgress = false;
 let lastPairingCode = null;
 let pairingCodeExpiresAt = 0;
 let lastIncomingJid = null;
@@ -918,10 +919,66 @@ app.get('/api/session', (req, res) => {
   res.set('Cache-Control', 'no-store');
   return res.json({
     whatsapp: waReady ? 'connected' : 'waiting',
+    pairingConfigured: Boolean(OWNER),
     pairingCode,
     pairingCodeExpiresAt: pairingCode ? new Date(pairingCodeExpiresAt).toISOString() : null,
     connectedAccount: connectedAccountPhone(),
   });
+});
+app.post('/api/session/pair', (req, res) => {
+  if (!SESSION_API_TOKEN || req.get(SESSION_API_TOKEN_HEADER) !== SESSION_API_TOKEN) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  res.set('Cache-Control', 'no-store');
+  if (waReady) return res.status(409).json({ status: 'connected', error: 'WhatsApp est déjà connecté.' });
+  if (!OWNER) return res.status(409).json({ pairingConfigured: false, error: 'Configure OWNER_NUMBER dans Render avant de demander un code.' });
+
+  const activeCode = pairingCodeExpiresAt > Date.now() ? lastPairingCode : null;
+  if (activeCode) {
+    return res.json({
+      status: 'code_available',
+      whatsapp: 'waiting',
+      pairingConfigured: true,
+      pairingCode: activeCode,
+      pairingCodeExpiresAt: new Date(pairingCodeExpiresAt).toISOString(),
+    });
+  }
+  if (pairingResetInProgress) {
+    return res.status(202).json({ status: 'pairing_started', whatsapp: 'waiting', pairingConfigured: true });
+  }
+
+  try {
+    const authPath = path.resolve(AUTH_DIR);
+    if ([path.parse(authPath).root, path.resolve(__dirname), path.resolve(process.cwd())].includes(authPath)) {
+      throw new Error('AUTH_DIR doit pointer vers un dossier dédié aux identifiants WhatsApp.');
+    }
+    pairingResetInProgress = true;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    pairingRequested = false;
+    lastPairingCode = null;
+    pairingCodeExpiresAt = 0;
+    waReady = false;
+
+    const oldSock = sock;
+    bootId += 1;
+    sock = null;
+    try { oldSock?.end(new Error('Nouvel appairage demandé depuis le tableau de bord.')); } catch {}
+
+    // Remove stale local credentials so startBot() will request a fresh code.
+    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    fs.mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
+    startBot().catch((error) => {
+      console.error('[PAIR] Redémarrage après réinitialisation impossible:', error?.message || error);
+      pairingResetInProgress = false;
+      scheduleReconnect(5000, 'pair-reset');
+    });
+    return res.status(202).json({ status: 'pairing_started', whatsapp: 'waiting', pairingConfigured: true });
+  } catch (error) {
+    pairingResetInProgress = false;
+    console.error('[PAIR] Réinitialisation impossible:', error?.message || error);
+    return res.status(500).json({ error: 'Impossible de préparer un nouvel appairage.' });
+  }
 });
 app.get('/health', (req, res) =>
   res.json({
@@ -975,9 +1032,11 @@ async function startBot() {
           const code = await sock.requestPairingCode(OWNER);
           lastPairingCode = code.length === 8 ? code.slice(0, 4) + '-' + code.slice(4) : code;
           pairingCodeExpiresAt = Date.now() + 10 * 60 * 1000;
+          pairingResetInProgress = false;
           console.log('[PAIR] Code généré et disponible via l’interface de session protégée.');
         } catch (e) {
           pairingRequested = false;
+          pairingResetInProgress = false;
           console.error('[PAIR] ERREUR:', e.message);
         }
       }, 6000);
@@ -1001,6 +1060,7 @@ async function startBot() {
       scheduleReconnect(5000, 'close');
     } else if (connection === 'open') {
       waReady = true;
+      pairingResetInProgress = false;
       console.log('\n[OK] CONNECTÉ À WHATSAPP | store= local\n');
       resolveChannelMetadata()
         .then((metadata) => {
