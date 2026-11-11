@@ -12,12 +12,14 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.24",
     "@google/generative-ai": "^0.24.0",
-    "pino": "^9.5.0",
-    "qrcode-terminal": "^0.12.0",
-    "express": "^4.21.1",
+    "@pdfme/common": "^6.2.8",
+    "@pdfme/generator": "^6.2.8",
+    "@pdfme/schemas": "^6.2.8",
+    "@whiskeysockets/baileys": "^6.7.24",
     "dotenv": "^16.4.5",
-    "pdfkit": "^0.15.2"
+    "express": "^4.21.1",
+    "pino": "^9.5.0",
+    "qrcode-terminal": "^0.12.0"
   }
 }
